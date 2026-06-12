@@ -84,36 +84,66 @@ except ImportError:
 TRADING_DAYS = 252
 HOLDING_DAYS = 63          # ~3 calendar months of trading days
 
+# Bars per year by interval (US equities, 6.5h regular session)
+PERIODS_PER_YEAR = {
+    "1d": 252,
+    "1h": 252 * 7,        # ~7 hourly bars per session
+    "30m": 252 * 13,
+    "15m": 252 * 26,
+    "5m": 252 * 78,
+}
+# yfinance lookback limits for intraday intervals
+DEFAULT_PERIOD = {"1d": None, "1h": "60d", "30m": "60d", "15m": "60d", "5m": "30d"}
+
+
+def periods_per_year(interval: str) -> int:
+    return PERIODS_PER_YEAR.get(interval, TRADING_DAYS)
+
 
 # ==============================================================================
 # 1. DATA ACQUISITION & PREPROCESSING
 # ==============================================================================
 class DataHandler:
-    """Fetches and cleans daily OHLCV data."""
+    """Fetches and cleans OHLCV data — daily history or live intraday bars.
 
-    def __init__(self, start: str = None, end: str = None, lookback_years: float = 3.0):
+    interval="1d"  : `lookback_years` of daily bars (default behaviour)
+    interval="1h"/"15m": last `period` (default 60d) of intraday bars,
+                     so the latest Close is up-to-the-minute during RTH.
+    """
+
+    def __init__(self, start: str = None, end: str = None,
+                 lookback_years: float = 3.0,
+                 interval: str = "1d", period: str = None):
+        self.interval = interval
+        self.period = period or DEFAULT_PERIOD.get(interval)
         self.end = pd.Timestamp(end) if end else pd.Timestamp.today().normalize()
         self.start = (pd.Timestamp(start) if start
                       else self.end - pd.DateOffset(years=lookback_years))
+        # Minimum history needed for filters/regime windows to make sense
+        self.min_bars = TRADING_DAYS if interval == "1d" else 200
 
     def fetch(self, tickers: list[str]) -> dict[str, pd.DataFrame]:
         """Returns {ticker: DataFrame[Open, High, Low, Close, Volume]}."""
         if not _HAS_YF:
             raise ImportError("yfinance is required: pip install yfinance")
 
-        raw = yf.download(
-            tickers, start=self.start, end=self.end,
-            auto_adjust=True, progress=False, group_by="ticker", threads=True,
-        )
+        kwargs = dict(auto_adjust=True, progress=False,
+                      group_by="ticker", threads=True, interval=self.interval)
+        if self.interval == "1d":
+            raw = yf.download(tickers, start=self.start, end=self.end, **kwargs)
+        else:
+            raw = yf.download(tickers, period=self.period, **kwargs)
+
         out: dict[str, pd.DataFrame] = {}
         for t in tickers:
             try:
                 df = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
                 df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-                if len(df) > TRADING_DAYS:          # need >= 1y of data
+                if len(df) > self.min_bars:
                     out[t] = df
                 else:
-                    print(f"[WARN] {t}: insufficient history, skipped.")
+                    print(f"[WARN] {t}: insufficient history "
+                          f"({len(df)} bars), skipped.")
             except KeyError:
                 print(f"[WARN] {t}: download failed, skipped.")
         return out
@@ -142,11 +172,12 @@ class KalmanTrendFilter:
     """
 
     def __init__(self, q_level: float = 1e-5, q_slope: float = 1e-7,
-                 r: float = 1e-3):
+                 r: float = 1e-3, periods_per_year: int = TRADING_DAYS):
         self.F = np.array([[1.0, 1.0], [0.0, 1.0]])
         self.H = np.array([[1.0, 0.0]])
         self.Q_scale = np.diag([q_level, q_slope])
         self.r_scale = r
+        self.ppy = periods_per_year   # bars/year: 252 daily, 1764 hourly, 6552 @15m
 
     def filter(self, prices: pd.Series) -> pd.DataFrame:
         """Run the filter on a price series.
@@ -184,8 +215,8 @@ class KalmanTrendFilter:
         return pd.DataFrame(
             {
                 "kf_price": np.exp(levels),                     # smoothed price
-                "kf_slope": slopes,                             # daily log-slope
-                "kf_slope_ann": slopes * TRADING_DAYS,          # annualised drift
+                "kf_slope": slopes,                             # per-bar log-slope
+                "kf_slope_ann": slopes * self.ppy,              # annualised drift
             },
             index=prices.index,
         )
@@ -289,10 +320,12 @@ class RiskParams:
 
 
 class RegimeFilter:
-    """ATR + rolling-volatility regime veto."""
+    """ATR + rolling-volatility regime veto (interval-aware)."""
 
-    def __init__(self, params: RiskParams):
+    def __init__(self, params: RiskParams,
+                 periods_per_year: int = TRADING_DAYS):
         self.p = params
+        self.ppy = periods_per_year
 
     def compute(self, df: pd.DataFrame) -> pd.DataFrame:
         p = self.p
@@ -303,8 +336,9 @@ class RegimeFilter:
         atr = tr.ewm(span=p.atr_window, adjust=False).mean()
 
         ret = df["Close"].pct_change()
-        vol = ret.rolling(p.vol_window).std() * np.sqrt(TRADING_DAYS)
-        vol_pct = vol.rolling(TRADING_DAYS, min_periods=63).rank(pct=True)
+        vol = ret.rolling(p.vol_window).std() * np.sqrt(self.ppy)
+        rank_win = min(self.ppy, max(len(df) // 2, 100))
+        vol_pct = vol.rolling(rank_win, min_periods=rank_win // 4).rank(pct=True)
 
         return pd.DataFrame(
             {
@@ -450,10 +484,12 @@ class Backtester:
     """
 
     def __init__(self, risk: RiskParams, cost_bps: float = 5.0,
-                 mode: str = "trend"):
+                 mode: str = "trend",
+                 periods_per_year: int = TRADING_DAYS):
         self.risk = risk
         self.cost = cost_bps / 1e4
         self.mode = mode               # 'trend' (price exits) or 'pairs' (z exits)
+        self.ppy = periods_per_year
 
     # --------------------------------------------------------------
     def run(self, df: pd.DataFrame,
@@ -534,7 +570,7 @@ class Backtester:
 
         eq_series = pd.Series(equity, index=dates[: len(equity)])
         return {"trades": trades, "equity": eq_series,
-                "metrics": Metrics.compute(eq_series, trades)}
+                "metrics": Metrics.compute(eq_series, trades, self.ppy)}
 
 
 # ==============================================================================
@@ -542,10 +578,11 @@ class Backtester:
 # ==============================================================================
 class Metrics:
     @staticmethod
-    def compute(equity: pd.Series, trades: list[Trade]) -> dict:
+    def compute(equity: pd.Series, trades: list[Trade],
+                ppy: int = TRADING_DAYS) -> dict:
         ret = equity.pct_change().dropna()
         total = equity.iloc[-1] / equity.iloc[0] - 1
-        sharpe = (ret.mean() / ret.std() * np.sqrt(TRADING_DAYS)
+        sharpe = (ret.mean() / ret.std() * np.sqrt(ppy)
                   if ret.std() > 0 else 0.0)
         dd = (equity / equity.cummax() - 1).min()
         wins = [t for t in trades if t.pnl_pct > 0]
@@ -570,10 +607,20 @@ class Screener:
 
     def __init__(self, risk: RiskParams = RiskParams(),
                  trend_params: TrendParams = TrendParams(),
-                 pairs_params: PairsParams = PairsParams()):
+                 pairs_params: PairsParams = PairsParams(),
+                 interval: str = "1d",
+                 kf_q: float = 1e-5, kf_r: float = 1e-3):
         self.risk = risk
-        self.rf = RegimeFilter(risk)
-        self.trend = TrendStrategy(trend_params, KalmanTrendFilter(), self.rf)
+        self.ppy = periods_per_year(interval)
+        # Slope noise scaled by (252/ppy)^2 so the *annualised* drift has
+        # comparable mobility at any bar frequency (reduces to q/100 daily).
+        q_slope = (kf_q / 100.0) * (TRADING_DAYS / self.ppy) ** 2
+        self.rf = RegimeFilter(risk, self.ppy)
+        self.trend = TrendStrategy(
+            trend_params,
+            KalmanTrendFilter(q_level=kf_q, q_slope=q_slope, r=kf_r,
+                              periods_per_year=self.ppy),
+            self.rf)
         self.pairs = PairsStrategy(pairs_params, KalmanPairsFilter(), self.rf)
         self.pairs_params = pairs_params
 
@@ -600,7 +647,8 @@ class Screener:
                 "Regime OK": bool(last["regime_ok"]),
             }
             if backtest:
-                bt = Backtester(self.risk, mode="trend").run(sig_df)
+                bt = Backtester(self.risk, mode="trend",
+                                periods_per_year=self.ppy).run(sig_df)
                 row.update({"BT Sharpe": bt["metrics"]["Sharpe Ratio"],
                             "BT Return": bt["metrics"]["Total Return"],
                             "BT MaxDD": bt["metrics"]["Max Drawdown"],
@@ -634,7 +682,8 @@ class Screener:
                 "Regime OK": bool(last["regime_ok"]),
             }
             if backtest:
-                bt = Backtester(self.risk, mode="pairs").run(
+                bt = Backtester(self.risk, mode="pairs",
+                                periods_per_year=self.ppy).run(
                     sig_df, pairs_params=self.pairs_params)
                 row.update({"BT Sharpe": bt["metrics"]["Sharpe Ratio"],
                             "BT Return": bt["metrics"]["Total Return"],
@@ -691,21 +740,24 @@ def resolve_universe(choice: str, custom: str = "") -> tuple[list[str], list[tup
 
 def run_screen(tickers: list[str], pairs: list[tuple[str, str]],
                label: str, lookback_years: float = 2.0,
-               run_pairs: bool = True) -> pd.DataFrame:
-    """Fetch live Yahoo data and run the full screen on one universe."""
+               run_pairs: bool = True, interval: str = "1d") -> pd.DataFrame:
+    """Fetch live Yahoo data (daily or intraday) and run the full screen."""
     hedge_tickers = {t for p in pairs for t in p} if run_pairs else set()
     all_tickers = sorted(set(tickers) | hedge_tickers)
 
+    span = (f"{lookback_years:.0f}y daily" if interval == "1d"
+            else f"{DEFAULT_PERIOD.get(interval, '60d')} @ {interval}")
     print(f"\n[{label}] Fetching {len(all_tickers)} tickers · "
-          f"{lookback_years:.0f}y daily history from Yahoo Finance...")
-    data = DataHandler(lookback_years=lookback_years).fetch(all_tickers)
+          f"{span} history from Yahoo Finance...")
+    data = DataHandler(lookback_years=lookback_years,
+                       interval=interval).fetch(all_tickers)
     if not data:
         print("No data downloaded — check tickers / connection.")
         return pd.DataFrame()
 
     # Only screen the requested names on trend (hedges are inputs only)
     trend_data = {t: df for t, df in data.items() if t in tickers}
-    screener = Screener()
+    screener = Screener(interval=interval)
     table = screener.scan(trend_data | {t: data[t] for t in hedge_tickers if t in data},
                           pair_list=pairs if run_pairs else None,
                           backtest=True)
@@ -734,13 +786,16 @@ def main():
                     help="Lookback window in years (default 2)")
     ap.add_argument("--no-pairs", action="store_true",
                     help="Skip the pairs/mean-reversion leg")
+    ap.add_argument("--interval", choices=["1d", "1h", "15m"], default="1d",
+                    help="Bar interval: 1d (2y) or intraday 1h/15m (last 60d)")
     args = ap.parse_args()
 
     # ---- Non-interactive mode (flags supplied) ----
     if args.basket or args.tickers:
         choice = args.basket or "custom"
         tickers, pairs, label = resolve_universe(choice, args.tickers or "")
-        run_screen(tickers, pairs, label, args.years, not args.no_pairs)
+        run_screen(tickers, pairs, label, args.years,
+                   not args.no_pairs, interval=args.interval)
         return
 
     # ---- Interactive mode ----

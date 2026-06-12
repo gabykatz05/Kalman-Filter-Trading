@@ -16,6 +16,7 @@ Demo mode (no internet needed): toggle "Demo data" in Settings.
 """
 
 import os
+import time
 
 import numpy as np
 import pandas as pd
@@ -92,27 +93,43 @@ def decision_strip(value: float, entry: float, rng: float,
     </div>"""
 
 
-def make_demo(tickers: list[str]) -> dict[str, pd.DataFrame]:
-    """Synthetic OHLCV so the app works with no internet."""
-    out, n = {}, 520
-    idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n)
+def make_demo(tickers: list[str], interval: str = "1d"
+              ) -> dict[str, pd.DataFrame]:
+    """Synthetic OHLCV so the app works with no internet (any interval)."""
+    ppy = ktf.periods_per_year(interval)
+    if interval == "1d":
+        n = 520
+        idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n)
+        bar_vol, hl = 0.013, 0.008
+    else:
+        n = 60 * (ppy // 252)                       # ~60 sessions of bars
+        freq = {"1h": "1h", "15m": "15min"}.get(interval, "15min")
+        idx = pd.date_range(end=pd.Timestamp.now().floor("min"),
+                            periods=n, freq=freq)
+        bar_vol = 0.013 * np.sqrt(252 / ppy)        # scale noise to bar size
+        hl = bar_vol * 0.6
+    out = {}
     for i, t in enumerate(tickers):
         rs = np.random.RandomState(100 + i)
-        d2 = rs.choice([1.2e-3, 4e-4, -8e-4])
-        drift = np.concatenate([np.full(300, 3e-4), np.full(n - 300, d2)])
-        px = 100 * np.exp(np.cumsum(drift + rs.normal(0, 0.013, n)))
+        d2 = rs.choice([0.30, 0.10, -0.20]) / ppy   # annualised regime drift
+        cut = int(n * 0.6)
+        drift = np.concatenate([np.full(cut, 0.08 / ppy), np.full(n - cut, d2)])
+        px = 100 * np.exp(np.cumsum(drift + rs.normal(0, bar_vol, n)))
         out[t] = pd.DataFrame(
-            {"Open": px, "High": px * 1.008, "Low": px * 0.992,
+            {"Open": px, "High": px * (1 + hl), "Low": px * (1 - hl),
              "Close": px, "Volume": rs.lognormal(15, 0.3, n)}, index=idx)
     return out
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_data(tickers: tuple[str, ...], years: float,
-              demo: bool) -> dict[str, pd.DataFrame]:
+@st.cache_data(show_spinner=False)
+def load_data(tickers: tuple[str, ...], years: float, interval: str,
+              demo: bool, freshness_key: int) -> dict[str, pd.DataFrame]:
+    # freshness_key buckets time so intraday data refetches every 5 min
+    # while daily data is reused for an hour.
     if demo:
-        return make_demo(list(tickers))
-    return ktf.DataHandler(lookback_years=years).fetch(list(tickers))
+        return make_demo(list(tickers), interval)
+    return ktf.DataHandler(lookback_years=years,
+                           interval=interval).fetch(list(tickers))
 
 
 # ------------------------------------------------------------------ header
@@ -139,10 +156,34 @@ else:
                 unsafe_allow_html=True)
 
 # ------------------------------------------------------------------ settings
+RESOLUTIONS = {
+    "Daily · 2y history": "1d",
+    "1-hour bars · last 60d (near-real-time)": "1h",
+    "15-min bars · last 60d (near-real-time)": "15m",
+}
+
 with st.expander("Settings"):
-    years = st.slider("History (years)", 1.0, 5.0, 2.0, 0.5)
-    slope_entry = st.slider("Trend entry drift (ann. %)", 2, 30, 10, 1) / 100
-    persist = st.slider("Slope persistence (days)", 2, 15, 5, 1)
+    res_label = st.selectbox("Data resolution", list(RESOLUTIONS))
+    interval = RESOLUTIONS[res_label]
+    ppy = ktf.periods_per_year(interval)
+    bars_per_day = max(1, ppy // 252)
+
+    years = st.slider("History (years, daily mode only)", 1.0, 5.0, 2.0, 0.5,
+                      disabled=(interval != "1d"))
+
+    st.caption("Kalman filter tuning — higher Q tracks live price faster "
+               "(less smoothing); higher R trusts the model over raw ticks.")
+    q_exp = st.slider("Kalman sensitivity Q (log\u2081\u2080)",
+                      -6.0, -2.0, -5.0, 0.5)
+    r_exp = st.slider("Measurement noise R (log\u2081\u2080)",
+                      -5.0, -1.0, -3.0, 0.5)
+    kf_q, kf_r = 10.0 ** q_exp, 10.0 ** r_exp
+
+    drift_default = 10 if interval == "1d" else 25
+    slope_entry = st.slider("Trend entry drift (ann. %)", 2, 80,
+                            drift_default, 1) / 100
+    persist = st.slider("Slope persistence (bars)", 2, 60,
+                        5 if interval == "1d" else bars_per_day, 1)
     vol_veto = st.slider("Vol veto percentile", 70, 99, 90, 1) / 100
     entry_z = st.slider("Pairs entry |z|", 1.0, 3.5, 2.0, 0.1)
     exit_z = st.slider("Pairs exit |z|", 0.0, 1.5, 0.5, 0.1)
@@ -158,9 +199,11 @@ if run and not tickers:
 
 if run and tickers:
     hedges = sorted({t for p in pairs for t in p} - set(tickers)) if run_pairs else []
-    with st.spinner(f"Fetching {len(tickers) + len(hedges)} tickers "
-                    f"({years:.0f}y daily)..."):
-        data = load_data(tuple(sorted(set(tickers) | set(hedges))), years, demo)
+    span = f"{years:.0f}y daily" if interval == "1d" else f"60d @ {interval}"
+    with st.spinner(f"Fetching {len(tickers) + len(hedges)} tickers ({span})..."):
+        ttl = 3600 if interval == "1d" else 300
+        data = load_data(tuple(sorted(set(tickers) | set(hedges))), years,
+                         interval, demo, int(time.time() // ttl))
 
     missing = [t for t in tickers if t not in data]
     if missing:
@@ -173,8 +216,13 @@ if run and tickers:
     risk = ktf.RiskParams(vol_pctile_veto=vol_veto)
     tp = ktf.TrendParams(slope_entry_ann=slope_entry, slope_persist=persist)
     pp = ktf.PairsParams(entry_z=entry_z, exit_z=exit_z)
-    rf = ktf.RegimeFilter(risk)
-    trend = ktf.TrendStrategy(tp, ktf.KalmanTrendFilter(), rf)
+    rf = ktf.RegimeFilter(risk, ppy)
+    # Slope noise scaled by (252/ppy)^2 -> comparable annualised-drift
+    # mobility at any bar frequency (reduces to Q/100 in daily mode).
+    q_slope = (kf_q / 100.0) * (252 / ppy) ** 2
+    trend = ktf.TrendStrategy(
+        tp, ktf.KalmanTrendFilter(q_level=kf_q, q_slope=q_slope, r=kf_r,
+                                  periods_per_year=ppy), rf)
     pairs_strat = ktf.PairsStrategy(pp, ktf.KalmanPairsFilter(), rf)
 
     # ---------------- trend cards ----------------
@@ -183,7 +231,8 @@ if run and tickers:
         if t not in data:
             continue
         sig_df = trend.generate(data[t])
-        bt = ktf.Backtester(risk, mode="trend").run(sig_df)
+        bt = ktf.Backtester(risk, mode="trend",
+                            periods_per_year=ppy).run(sig_df)
         last = sig_df.iloc[-1]
         lab = {1: "BUY", -1: "SELL", 0: "HOLD"}[int(last["signal"])]
         results.append((t, sig_df, bt, last, lab))
@@ -196,11 +245,15 @@ if run and tickers:
 
     for t, sig_df, bt, last, lab in results:
         with st.container(border=True):
+            ts = sig_df.index[-1]
+            ts_str = (ts.strftime("%d %b") if interval == "1d"
+                      else ts.strftime("%d %b %H:%M"))
             st.markdown(
                 f'<span class="tkr">{t}</span>{badge(lab)}'
                 f'<div class="sub">Trend · KF drift '
                 f'{last["kf_slope_ann"]*100:.1f}% ann. · regime '
-                f'{"OK" if last["regime_ok"] else "VETO"}</div>',
+                f'{"OK" if last["regime_ok"] else "VETO"} · '
+                f'last bar {ts_str}</div>',
                 unsafe_allow_html=True)
 
             c1, c2, c3 = st.columns(3)
@@ -210,7 +263,7 @@ if run and tickers:
             c3.metric("R : R", f"{rr:.1f} : 1")
 
             st.markdown(decision_strip(
-                last["kf_slope_ann"], slope_entry, 0.35,
+                last["kf_slope_ann"], slope_entry, max(0.35, slope_entry * 3),
                 "sell zone", "neutral", "buy zone", C_SELL_BG, C_BUY_BG),
                 unsafe_allow_html=True)
 
