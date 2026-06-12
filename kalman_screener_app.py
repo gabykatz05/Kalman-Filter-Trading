@@ -27,35 +27,42 @@ import kalman_trading_framework as ktf
 st.set_page_config(page_title="Kalman Screener", page_icon="📈",
                    layout="centered", initial_sidebar_state="collapsed")
 
-C_KF, C_BUY, C_SELL, C_HOLD = "#2B5DA8", "#0E7C4F", "#C03434", "#8A6D1F"
-C_BUY_BG, C_SELL_BG, C_HOLD_BG = "#E4F2EB", "#F9E7E7", "#FBF3DC"
+C_KF, C_BUY, C_SELL, C_HOLD = "#2B5DA8", "#18A065", "#E05252", "#C99A2E"
+# Translucent zone/badge backgrounds render correctly on light AND dark themes
+BUY_BG, SELL_BG, HOLD_BG = ("rgba(24,160,101,.16)", "rgba(224,82,82,.16)",
+                            "rgba(201,154,46,.16)")
+C_BUY_BG, C_SELL_BG, C_HOLD_BG = BUY_BG, SELL_BG, HOLD_BG   # strip zones & badges
 
-st.markdown(f"""
+st.markdown("""
 <style>
-  /* mobile-first tightening */
-  .block-container {{ padding: 1.0rem 0.9rem 3rem; max-width: 560px; }}
-  #MainMenu, footer, header {{ visibility: hidden; }}
-  div[data-testid="stMetric"] {{ background: #fff; border: 1px solid #E4E6EA;
-      border-radius: 12px; padding: 8px 10px; }}
-  div[data-testid="stMetricValue"] {{ font-size: 1.05rem;
-      font-family: ui-monospace, Menlo, monospace; }}
-  div[data-testid="stMetricLabel"] {{ font-size: 0.70rem; }}
-  .badge {{ font-family: ui-monospace, Menlo, monospace; font-weight: 700;
+  /* mobile-first tightening — theme-adaptive (works in light & dark) */
+  .block-container { padding: 1.0rem 0.9rem 3rem; max-width: 560px; }
+  #MainMenu, footer, header { visibility: hidden; }
+  div[data-testid="stMetric"] {
+      background: var(--secondary-background-color, rgba(128,128,128,.08));
+      border: 1px solid rgba(128,128,128,.28);
+      border-radius: 12px; padding: 8px 10px; }
+  div[data-testid="stMetricValue"] { font-size: 1.05rem;
+      color: var(--text-color);
+      font-family: ui-monospace, Menlo, monospace; }
+  div[data-testid="stMetricLabel"] { font-size: 0.70rem; }
+  .badge { font-family: ui-monospace, Menlo, monospace; font-weight: 700;
       font-size: 0.75rem; letter-spacing: .08em; border-radius: 6px;
-      padding: 3px 9px; float: right; }}
-  .tkr {{ font-family: ui-monospace, Menlo, monospace; font-weight: 700;
-      font-size: 1.0rem; }}
-  .sub {{ color: #6B7280; font-size: 0.74rem; }}
-  .strip-wrap {{ margin: 8px 0 2px; }}
-  .strip {{ position: relative; height: 8px; border-radius: 4px;
-      background: #E4E6EA; overflow: visible; }}
-  .zone {{ position: absolute; top: 0; bottom: 0; }}
-  .marker {{ position: absolute; top: -2px; width: 10px; height: 12px;
-      border-radius: 3px; background: #16191D; border: 2px solid #fff;
-      box-shadow: 0 1px 2px rgba(0,0,0,.25); }}
-  .striplbl {{ display: flex; justify-content: space-between; color: #6B7280;
+      padding: 3px 9px; float: right; }
+  .tkr { font-family: ui-monospace, Menlo, monospace; font-weight: 700;
+      font-size: 1.0rem; color: var(--text-color); }
+  .sub { color: #8A919C; font-size: 0.74rem; }
+  .strip-wrap { margin: 8px 0 2px; }
+  .strip { position: relative; height: 8px; border-radius: 4px;
+      background: rgba(128,128,128,.25); overflow: visible; }
+  .zone { position: absolute; top: 0; bottom: 0; }
+  .marker { position: absolute; top: -2px; width: 10px; height: 12px;
+      border-radius: 3px; background: var(--text-color, #16191D);
+      border: 2px solid var(--background-color, #fff);
+      box-shadow: 0 1px 2px rgba(0,0,0,.25); }
+  .striplbl { display: flex; justify-content: space-between; color: #8A919C;
       font-family: ui-monospace, Menlo, monospace; font-size: 0.62rem;
-      margin-top: 3px; }}
+      margin-top: 3px; }
 </style>
 """, unsafe_allow_html=True)
 
