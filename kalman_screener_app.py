@@ -596,7 +596,7 @@ def get_fundamentals(t: str, demo: bool) -> dict:
                 "debt_to_equity": rs.uniform(20, 200),
                 "fcf": shares * price * rs.uniform(0.02, 0.07),
                 "auto_fcf": shares * price * rs.uniform(0.03, 0.07),
-                "auto_fcf_source": "forward earnings × shares",
+                "auto_fcf_source": "3yr avg FCF (statements)",
                 "trailing_growth": g, "growth_source": "revenue growth",
                 "currency": "USD"}
 
@@ -617,7 +617,7 @@ def get_fundamentals(t: str, demo: bool) -> dict:
     peg = g("trailingPegRatio") or info.get("pegRatio")
     proxy_g, proxy_src = resolve_growth(t, fwd_pe, peg)
     yahoo_fcf = g("freeCashflow")
-    auto_fcf, auto_src = auto_normalize_fcf(info, yahoo_fcf)
+    auto_fcf, auto_src = auto_normalize_fcf(t, info, yahoo_fcf)
     return {
         "name": info.get("shortName") or info.get("longName") or t,
         "price": info.get("currentPrice") or info.get("regularMarketPrice"),
@@ -640,55 +640,67 @@ def get_fundamentals(t: str, demo: bool) -> dict:
     }
 
 
-def auto_normalize_fcf(info, yahoo_fcf):
-    """Estimate a normalized annual FCF using fields that are NOT drawn from
-    the same distorted trailing-twelve-month window as info['freeCashflow'].
+def auto_normalize_fcf(ticker, info, yahoo_fcf):
+    """Normalized starting FCF, robust to BOTH failure modes seen in testing:
+      • one-off timing dips (LMT: a single negative-FCF quarter), and
+      • structural earnings-vs-FCF gaps (MSFT: net income ~2× FCF during the
+        AI-capex build).
 
-    Key insight: info['freeCashflow'] AND info['operatingCashflow'] share the
-    same TTM window, so a single bad quarter (e.g. LMT's negative-FCF Q1 from
-    billing timing) depresses both — rebuilding from them can't fix it.
+    The previous forward-earnings anchor solved the first but caused the
+    second — net income ignores capex, so it doubled MSFT's true FCF. This
+    version anchors on ACTUAL cash flow and never lets earnings override it:
 
-    The one forward-looking, un-bugged signal in the light endpoint is analyst
-    forward earnings. forwardEps × shares ≈ normalized forward net income,
-    which for mature profitable firms is a good proxy for run-rate FCF and
-    reflects a recovery the trailing window misses.
-
-    Logic:
-      anchor   = forwardEps × shares   (else trailingEps × shares)
-      trailing = Yahoo freeCashflow
-      • anchor only            -> anchor
-      • trailing only          -> trailing
-      • anchor ≥ trailing      -> anchor   (trailing looked depressed: LMT case)
-      • anchor < trailing      -> mean(anchor, trailing)  (FCF structurally
-                                   above earnings; don't overstate via NI alone)
+      1. Multi-year average of annual FCF from statements — the proper
+         normalizer; smooths a one-off bad quarter AND reflects real capex.
+         Guarded + lazy: a rate-limit just falls through.
+      2. Reported trailing-twelve-month FCF (Yahoo freeCashflow) — the real
+         operating-cash-flow-minus-capex figure. Correct for the large
+         majority of names, INCLUDING capex-heavy ones like MSFT.
+      3. Forward earnings × shares × 0.8 (rough capex haircut) — last resort
+         only when no cash-flow figure exists at all.
     Returns (fcf_or_None, source_label).
     """
-    def num(k):
-        v = info.get(k)
+    def num(d, k):
+        v = d.get(k) if d else None
         return float(v) if isinstance(v, (int, float)) and np.isfinite(v) else None
 
-    shares = num("sharesOutstanding")
-    fwd_eps = num("forwardEps")
-    trl_eps = num("trailingEps")
+    # 1. Multi-year average annual FCF (best at smoothing timing dips) ---------
+    try:
+        cf = yf.Ticker(ticker).cashflow                 # annual statements
+        if cf is not None and not cf.empty:
+            row = None
+            for nm in ("Free Cash Flow", "FreeCashFlow"):
+                if nm in cf.index:
+                    row = cf.loc[nm].dropna()
+                    break
+            if row is None and "Operating Cash Flow" in cf.index:
+                ocf_r = cf.loc["Operating Cash Flow"].dropna()
+                capex_r = None
+                for cn in ("Capital Expenditure", "Capital Expenditures"):
+                    if cn in cf.index:
+                        capex_r = cf.loc[cn].dropna()
+                        break
+                if capex_r is not None:
+                    common = ocf_r.index.intersection(capex_r.index)
+                    row = ocf_r[common] - capex_r[common].abs()
+            if row is not None and len(row) >= 2:
+                vals = [float(v) for v in row.head(3)
+                        if np.isfinite(v) and v > 0]
+                if vals:
+                    return sum(vals) / len(vals), f"{len(vals)}yr avg FCF (statements)"
+    except Exception:
+        pass  # rate-limited / unavailable — fall through
 
-    anchor, anchor_lbl = None, None
-    if shares and fwd_eps and fwd_eps > 0:
-        anchor, anchor_lbl = fwd_eps * shares, "forward earnings × shares"
-    elif shares and trl_eps and trl_eps > 0:
-        anchor, anchor_lbl = trl_eps * shares, "trailing earnings × shares"
+    # 2. Reported TTM FCF (correct for most, incl. capex-heavy names) ----------
+    if yahoo_fcf and np.isfinite(yahoo_fcf) and yahoo_fcf > 0:
+        return float(yahoo_fcf), "reported TTM FCF"
 
-    trailing = float(yahoo_fcf) if (yahoo_fcf and np.isfinite(yahoo_fcf)
-                                    and yahoo_fcf > 0) else None
-
-    if anchor is not None and trailing is not None:
-        if anchor >= trailing:
-            return anchor, f"{anchor_lbl} (Yahoo {trailing/1e9:.1f}B looked depressed)"
-        return (anchor + trailing) / 2.0, f"mean({anchor_lbl}, Yahoo FCF)"
-    if anchor is not None:
-        return anchor, anchor_lbl
-    if trailing is not None:
-        return trailing, "Yahoo FCF"
-    return None, "Yahoo FCF"
+    # 3. Last resort: forward earnings with a capex haircut --------------------
+    shares = num(info, "sharesOutstanding")
+    fwd = num(info, "forwardEps") or num(info, "trailingEps")
+    if shares and fwd and fwd > 0:
+        return fwd * shares * 0.80, "forward earnings ×0.8 (no FCF data)"
+    return None, "no FCF data"
 
 
 def resolve_growth(ticker, fwd_pe, peg):
