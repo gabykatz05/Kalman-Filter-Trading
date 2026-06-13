@@ -144,6 +144,180 @@ st.markdown('<div style="font-size:1.35rem;font-weight:700;'
             unsafe_allow_html=True)
 st.write("")
 
+# ------------------------------------------------------------------ glossary
+GLOSSARY_VALUATION = [
+    ("WACC / Discount Rate", C_KF, [
+        "The annual rate used to discount future cash flows back to today — "
+        "the return you demand for the risk taken.",
+        "<b>Lower WACC → higher fair value</b> (future cash worth more today); "
+        "<b>higher WACC → lower fair value</b>.",
+        "It also sets the exit multiple: high-quality megacaps arguably "
+        "deserve a <b>lower</b> WACC (~7%) than the 9% default.",
+    ]),
+    ("FCF Growth Override", C_KF, [
+        "Bypasses the historical / analyst growth estimate and applies "
+        "<b>your own</b> annual free-cash-flow growth assumption.",
+        "Off → uses Yahoo's trailing revenue growth as a proxy. "
+        "On → uses your slider value for the full 5-year projection.",
+        "Use it to <b>stress-test</b>: the caption always shows both the rate "
+        "in use and the historical baseline for comparison.",
+    ]),
+    ("Fade to 2.5% (Fade Mechanism)", C_KF, [
+        "The model does <b>not</b> hold the starting growth rate flat. It "
+        "decays it <b>linearly</b> toward the 2.5% terminal rate over 5 years.",
+        "Example: a +17% start steps down roughly 17 → 14 → 11 → 8 → 2.5%.",
+        "This mirrors reality — <b>no company compounds at peak growth "
+        "forever</b>; competition and scale pull it toward the economy's rate.",
+    ]),
+    ("Terminal Growth & Terminal Multiple", C_HOLD, [
+        "<b>Terminal growth</b> (2.5%) = the perpetual rate cash flows grow "
+        "after year 5, roughly long-run nominal GDP.",
+        "The Gordon formula locks in the <b>exit multiple = 1 / (WACC − "
+        "terminal growth)</b>. At 9% / 2.5% that's ~15.8× FCF.",
+        "This is why the DCF is anchored: change WACC or terminal growth and "
+        "the entire valuation re-prices through that multiple.",
+    ]),
+    ("DCF Fair Value vs. Market Price", C_HOLD, [
+        "<b>Fair value</b> = present value of 5 years of projected FCF + the "
+        "discounted terminal value, divided by shares.",
+        "A strict DCF is <b>structurally conservative</b>: it caps the exit "
+        "multiple and won't extrapolate hyper-growth beyond the window.",
+        "The market often pays far more (e.g. ~43× FCF for Apple), pricing in "
+        "lower risk or longer growth — the gap is a <b>question to "
+        "investigate</b>, not proof of mispricing.",
+    ]),
+    ("Medium-Term (Kalman) Drift", C_BUY, [
+        "The Kalman filter strips daily noise from price to estimate the "
+        "<b>true underlying trend</b> — a lag-free moving average.",
+        "<b>Drift</b> = that trend's annualised slope. Positive = structural "
+        "uptrend; negative = downtrend.",
+        "It's a <b>momentum overlay</b> on the fundamental view: the matrix "
+        "crosses 'is it cheap?' (DCF) with 'is it trending?' (Kalman).",
+    ]),
+    ("ROE — Megacap Caution", C_SELL, [
+        "Return on Equity = net income ÷ shareholder equity. Normally a "
+        "quality gauge — but <b>distorted by buybacks</b>.",
+        "Heavy repurchases (Apple) <b>shrink book equity toward zero</b>, "
+        "inflating the denominator's effect and pushing ROE to 100%+.",
+        "<b>ROIC is more reliable</b> for these names — read a sky-high ROE as "
+        "a balance-sheet artifact, not 100%+ returns on capital.",
+    ]),
+    ("Scorecard & Verdict", C_HOLD, [
+        "A 0–10 cross-check on the DCF scoring ROE, P/E, PEG and revenue "
+        "growth — guards against a single bad input swinging the verdict.",
+        "<b>Undervalued</b> = DCF upside &gt; +20%; <b>Overvalued</b> = "
+        "downside &gt; 15%; otherwise <b>Fairly Valued</b> (asymmetry = "
+        "built-in margin of safety).",
+    ]),
+    ("Hybrid Decision Matrix", C_BUY, [
+        "Combines the two timeframes into one action: fundamental verdict "
+        "(1–5y) × Kalman trend (≈3-month).",
+        "<b>Undervalued + BUY → Accumulate</b> (strongest); "
+        "<b>Overvalued + BUY → Speculative</b> (momentum only, tight stops); "
+        "<b>Undervalued + SELL → Wait</b> (value-trap risk).",
+        "When the two views <b>disagree</b>, the matrix surfaces it rather "
+        "than averaging them away.",
+    ]),
+]
+
+
+GLOSSARY_KALMAN = [
+    ("Kalman Filter", C_KF, [
+        "A recursive estimator that separates the <b>true signal</b> from "
+        "random noise. Here it smooths price into a clean trend line.",
+        "Unlike a moving average it has <b>no lag</b> — it updates its estimate "
+        "the instant a new price arrives, weighting it against its prediction.",
+    ]),
+    ("Q — Process Noise (log\u2081\u2080)", C_KF, [
+        "How much the 'true' trend is allowed to move each bar. Shown as "
+        "<b>log\u2081\u2080</b>: a value of \u22125 means Q = 10\u207b\u2075 = "
+        "0.00001.",
+        "<b>Higher Q (e.g. \u22123)</b> → line reacts fast, hugs price, more "
+        "noise. <b>Lower Q (e.g. \u22126)</b> → very smooth, slow to turn.",
+    ]),
+    ("R — Measurement Noise (log\u2081\u2080)", C_KF, [
+        "How noisy the model assumes each raw price is. Also log\u2081\u2080, so "
+        "\u22123 = R = 0.001.",
+        "<b>Higher R</b> → trust each tick less, lean on the model's own "
+        "prediction (smoother). It's the <b>counterweight to Q</b>.",
+        "What matters is the <b>ratio Q/R</b>: large Q/R hugs price, small Q/R "
+        "produces a calm, slow line.",
+    ]),
+    ("Drift (Annualised Slope)", C_BUY, [
+        "The slope of the Kalman trend, scaled to a yearly rate. <b>+45% "
+        "drift</b> = the current trend implies a 45%/yr rise if sustained.",
+        "Positive = structural uptrend, negative = downtrend. The "
+        "<b>entry-drift</b> slider sets how steep it must be to trigger a BUY.",
+        "Scaling adapts to the data: daily uses 252 bars/yr, 15-min uses 6,552, "
+        "so the % is comparable across resolutions.",
+    ]),
+    ("Z-Score (Pairs Spread)", C_HOLD, [
+        "For two related assets, the <b>spread</b> is what's left after hedging "
+        "one against the other. Z-score = how many standard deviations that "
+        "spread sits from its mean.",
+        "<b>|z| &gt; entry</b> (e.g. 2.0) → the spread is stretched → bet on it "
+        "reverting. <b>|z| &lt; exit</b> (e.g. 0.5) → reverted → close.",
+        "Self-normalising, so it works across pairs with different volatility.",
+    ]),
+    ("Hedge Ratio \u03b2 (beta)", C_HOLD, [
+        "How many units of the hedge asset offset one unit of the traded asset. "
+        "A second Kalman filter estimates it <b>dynamically</b> over time.",
+        "\u03b2 = 1.25 → short 1.25 shares of the hedge for every share held — "
+        "the combination is what mean-reverts.",
+    ]),
+    ("Cointegration (p-value)", C_HOLD, [
+        "Tests whether two prices share a <b>long-run equilibrium</b> they keep "
+        "returning to — the precondition for pairs trading.",
+        "<b>p &lt; 0.05</b> → statistically cointegrated, pair accepted. Higher "
+        "→ rejected (the spread could wander forever — a value trap).",
+    ]),
+    ("ATR · Stop · Target · R:R", C_SELL, [
+        "<b>ATR</b> (Average True Range) measures a stock's typical move. Stops "
+        "and targets are set as multiples of it, so they adapt to volatility.",
+        "Default stop = 2.5\u00d7 ATR, target = 5\u00d7 ATR → <b>Risk:Reward = "
+        "2:1</b>. You risk 1 to make 2.",
+    ]),
+    ("Regime Veto (Vol Percentile)", C_SELL, [
+        "Ranks current volatility against the past year. When it's in the top "
+        "decile (90th pct+), <b>new entries are blocked</b>.",
+        "Keeps you out during market-wide panics where signals are unreliable. "
+        "Shows as 'regime OK' or 'VETO' on each card.",
+    ]),
+    ("Data Resolution", C_KF, [
+        "<b>Daily (2y)</b> — the core 3-month strategy; cleanest signal.",
+        "<b>1h / 15m (60d)</b> — near-real-time price for timing entries. "
+        "Per-bar noise is far higher, so thresholds auto-loosen and these are "
+        "best as a <b>timing overlay</b>, not the primary signal.",
+    ]),
+    ("Decision Strip", C_BUY, [
+        "The little bar under each card. The marker shows where current drift "
+        "(or z-score) sits between the <b>sell zone</b>, neutral band, and "
+        "<b>buy zone</b> — so you see <i>why</i> a card is HOLD, not just that "
+        "it is.",
+    ]),
+]
+
+
+def render_glossary(entries):
+    """Scannable dark/light-adaptive glossary. Body text inherits Streamlit's
+    themed text color (no hardcoded fallback, so it's readable on any theme)."""
+    cards = []
+    for title, accent, points in entries:
+        items = "".join(f'<li style="margin:3px 0">{p}</li>' for p in points)
+        cards.append(
+            f'<div style="border:1px solid rgba(128,128,128,.22);'
+            f'border-left:3px solid {accent};border-radius:10px;'
+            f'padding:10px 12px;margin-bottom:8px;'
+            f'background:rgba(128,128,128,.08)">'
+            f'<div style="font-family:ui-monospace,Menlo,monospace;'
+            f'font-weight:700;font-size:0.82rem;color:{accent};'
+            f'margin-bottom:4px">{title}</div>'
+            f'<ul style="margin:0;padding-left:16px;font-size:0.76rem;'
+            f'line-height:1.45;opacity:0.92">{items}</ul>'
+            f'</div>')
+    st.markdown("".join(cards), unsafe_allow_html=True)
+
+
 tab_screen, tab_value = st.tabs(["Screener", "Long-Term Valuation"])
 
 with tab_screen:
@@ -171,33 +345,69 @@ with tab_screen:
     }
 
     with st.expander("Settings"):
-        res_label = st.selectbox("Data resolution", list(RESOLUTIONS))
+        res_label = st.selectbox(
+            "Data resolution", list(RESOLUTIONS),
+            help="Daily uses 2 years of end-of-day bars (best for the "
+                 "3-month strategy). 1h / 15m pull the last 60 days of "
+                 "intraday bars so the latest price is near-real-time — "
+                 "better for timing entries than for the core signal.")
         interval = RESOLUTIONS[res_label]
         ppy = ktf.periods_per_year(interval)
         bars_per_day = max(1, ppy // 252)
 
         years = st.slider("History (years, daily mode only)", 1.0, 5.0, 2.0, 0.5,
-                          disabled=(interval != "1d"))
+                          disabled=(interval != "1d"),
+                          help="How much daily history to load. More history "
+                               "= more backtest trades but older regimes.")
 
         st.caption("Kalman filter tuning — higher Q tracks live price faster "
                    "(less smoothing); higher R trusts the model over raw ticks.")
-        q_exp = st.slider("Kalman sensitivity Q (log\u2081\u2080)",
-                          -6.0, -2.0, -5.0, 0.5)
-        r_exp = st.slider("Measurement noise R (log\u2081\u2080)",
-                          -5.0, -1.0, -3.0, 0.5)
+        q_exp = st.slider(
+            "Kalman sensitivity Q (log\u2081\u2080)", -6.0, -2.0, -5.0, 0.5,
+            help="Process noise. Shown as log\u2081\u2080, so \u22125 means "
+                 "Q = 10\u207b\u2075 = 0.00001. HIGHER (e.g. \u22123) = the "
+                 "Kalman line reacts fast to new prices (less smoothing, more "
+                 "noise). LOWER (e.g. \u22126) = very smooth, slow to turn.")
+        r_exp = st.slider(
+            "Measurement noise R (log\u2081\u2080)", -5.0, -1.0, -3.0, 0.5,
+            help="Measurement noise. Also log\u2081\u2080, so \u22123 means "
+                 "R = 0.001. HIGHER R = the filter distrusts each raw tick and "
+                 "leans on its own prediction (smoother). It's the counterweight "
+                 "to Q: the ratio Q/R sets how tightly the line hugs price.")
         kf_q, kf_r = 10.0 ** q_exp, 10.0 ** r_exp
 
         drift_default = 10 if interval == "1d" else 25
-        slope_entry = st.slider("Trend entry drift (ann. %)", 2, 80,
-                                drift_default, 1) / 100
-        persist = st.slider("Slope persistence (bars)", 2, 60,
-                            5 if interval == "1d" else bars_per_day, 1)
-        vol_veto = st.slider("Vol veto percentile", 70, 99, 90, 1) / 100
-        entry_z = st.slider("Pairs entry |z|", 1.0, 3.5, 2.0, 0.1)
-        exit_z = st.slider("Pairs exit |z|", 0.0, 1.5, 0.5, 0.1)
-        run_pairs = st.toggle("Run pairs leg", value=True)
+        slope_entry = st.slider(
+            "Trend entry drift (ann. %)", 2, 80, drift_default, 1,
+            help="Minimum annualised Kalman slope to trigger a BUY. The drift "
+                 "is the filter's trend, annualised. 10% = only act on trends "
+                 "implying \u2265+10%/yr.") / 100
+        persist = st.slider(
+            "Slope persistence (bars)", 2, 60,
+            5 if interval == "1d" else bars_per_day, 1,
+            help="The drift must stay above the threshold this many bars in a "
+                 "row before a signal fires — filters out one-day head-fakes.")
+        vol_veto = st.slider(
+            "Vol veto percentile", 70, 99, 90, 1,
+            help="Regime filter. Blocks new entries when recent volatility is "
+                 "in its top X% vs the past year — keeps you out during "
+                 "market-wide stress. 90 = veto the most volatile 10%.") / 100
+        entry_z = st.slider(
+            "Pairs entry |z|", 1.0, 3.5, 2.0, 0.1,
+            help="Z-score = how many standard deviations the pair's spread is "
+                 "from its mean. Enter a mean-reversion trade when |z| exceeds "
+                 "this. 2.0 = act when the spread is a 2-sigma stretch.")
+        exit_z = st.slider(
+            "Pairs exit |z|", 0.0, 1.5, 0.5, 0.1,
+            help="Close the pairs trade once the spread reverts back inside "
+                 "this z-score band. 0.5 = exit near the mean.")
+        run_pairs = st.toggle("Run pairs leg", value=True,
+                              help="Also test each name against its hedge ETF "
+                                   "for mean-reversion (pairs) opportunities.")
         demo = st.toggle("Demo data (offline / no Yahoo)",
-                         value=bool(os.environ.get("KALMAN_DEMO")))
+                         value=bool(os.environ.get("KALMAN_DEMO")),
+                         help="Use synthetic data so the UI works with no "
+                              "internet / when Yahoo rate-limits.")
 
     run = st.button("Run screen", type="primary", use_container_width=True)
 
@@ -333,6 +543,10 @@ with tab_screen:
                     'vol-percentile regime veto, 63-day time exit. '
                     'Not investment advice.</div>', unsafe_allow_html=True)
 
+    # ---- Kalman / screener glossary (always visible) ----
+    with st.expander("📖 Glossary — Kalman, Q/R, z-score & screener terms"):
+        render_glossary(GLOSSARY_KALMAN)
+
 
 # ==============================================================================
 # LONG-TERM VALUATION TAB — fundamentals + DCF + hybrid decision matrix
@@ -445,100 +659,6 @@ def scorecard(f, upside):
     return pts, " · ".join(notes)
 
 
-# ------------------------------------------------------------------ glossary
-GLOSSARY = [
-    ("WACC / Discount Rate", C_KF, [
-        "The annual rate used to discount future cash flows back to today — "
-        "the return you demand for the risk taken.",
-        "<b>Lower WACC → higher fair value</b> (future cash worth more today); "
-        "<b>higher WACC → lower fair value</b>.",
-        "It also sets the exit multiple: high-quality megacaps arguably "
-        "deserve a <b>lower</b> WACC (~7%) than the 9% default.",
-    ]),
-    ("FCF Growth Override", C_KF, [
-        "Bypasses the historical / analyst growth estimate and applies "
-        "<b>your own</b> annual free-cash-flow growth assumption.",
-        "Off → uses Yahoo's trailing revenue growth as a proxy. "
-        "On → uses your slider value for the full 5-year projection.",
-        "Use it to <b>stress-test</b>: the caption always shows both the rate "
-        "in use and the historical baseline for comparison.",
-    ]),
-    ("Fade to 2.5% (Fade Mechanism)", C_KF, [
-        "The model does <b>not</b> hold the starting growth rate flat. It "
-        "decays it <b>linearly</b> toward the 2.5% terminal rate over 5 years.",
-        "Example: a +17% start steps down roughly 17 → 14 → 11 → 8 → 2.5%.",
-        "This mirrors reality — <b>no company compounds at peak growth "
-        "forever</b>; competition and scale pull it toward the economy's rate.",
-    ]),
-    ("Terminal Growth & Terminal Multiple", C_HOLD, [
-        "<b>Terminal growth</b> (2.5%) = the perpetual rate cash flows grow "
-        "after year 5, roughly long-run nominal GDP.",
-        "The Gordon formula locks in the <b>exit multiple = 1 / (WACC − "
-        "terminal growth)</b>. At 9% / 2.5% that's ~15.8× FCF.",
-        "This is why the DCF is anchored: change WACC or terminal growth and "
-        "the entire valuation re-prices through that multiple.",
-    ]),
-    ("DCF Fair Value vs. Market Price", C_HOLD, [
-        "<b>Fair value</b> = present value of 5 years of projected FCF + the "
-        "discounted terminal value, divided by shares.",
-        "A strict DCF is <b>structurally conservative</b>: it caps the exit "
-        "multiple and won't extrapolate hyper-growth beyond the window.",
-        "The market often pays far more (e.g. ~43× FCF for Apple), pricing in "
-        "lower risk or longer growth — the gap is a <b>question to "
-        "investigate</b>, not proof of mispricing.",
-    ]),
-    ("Medium-Term (Kalman) Drift", C_BUY, [
-        "The Kalman filter strips daily noise from price to estimate the "
-        "<b>true underlying trend</b> — a lag-free moving average.",
-        "<b>Drift</b> = that trend's annualised slope. Positive = structural "
-        "uptrend; negative = downtrend.",
-        "It's a <b>momentum overlay</b> on the fundamental view: the matrix "
-        "crosses 'is it cheap?' (DCF) with 'is it trending?' (Kalman).",
-    ]),
-    ("ROE — Megacap Caution", C_SELL, [
-        "Return on Equity = net income ÷ shareholder equity. Normally a "
-        "quality gauge — but <b>distorted by buybacks</b>.",
-        "Heavy repurchases (Apple) <b>shrink book equity toward zero</b>, "
-        "inflating the denominator's effect and pushing ROE to 100%+.",
-        "<b>ROIC is more reliable</b> for these names — read a sky-high ROE as "
-        "a balance-sheet artifact, not 100%+ returns on capital.",
-    ]),
-    ("Scorecard & Verdict", C_HOLD, [
-        "A 0–10 cross-check on the DCF scoring ROE, P/E, PEG and revenue "
-        "growth — guards against a single bad input swinging the verdict.",
-        "<b>Undervalued</b> = DCF upside &gt; +20%; <b>Overvalued</b> = "
-        "downside &gt; 15%; otherwise <b>Fairly Valued</b> (asymmetry = "
-        "built-in margin of safety).",
-    ]),
-    ("Hybrid Decision Matrix", C_BUY, [
-        "Combines the two timeframes into one action: fundamental verdict "
-        "(1–5y) × Kalman trend (≈3-month).",
-        "<b>Undervalued + BUY → Accumulate</b> (strongest); "
-        "<b>Overvalued + BUY → Speculative</b> (momentum only, tight stops); "
-        "<b>Undervalued + SELL → Wait</b> (value-trap risk).",
-        "When the two views <b>disagree</b>, the matrix surfaces it rather "
-        "than averaging them away.",
-    ]),
-]
-
-
-def render_glossary():
-    """Scannable dark-mode glossary; safe to call without analysis run."""
-    cards = []
-    for title, accent, points in GLOSSARY:
-        items = "".join(f'<li style="margin:3px 0">{p}</li>' for p in points)
-        cards.append(
-            f'<div style="border:1px solid rgba(128,128,128,.22);'
-            f'border-left:3px solid {accent};border-radius:10px;'
-            f'padding:10px 12px;margin-bottom:8px;'
-            f'background:rgba(128,128,128,.05)">'
-            f'<div style="font-family:ui-monospace,Menlo,monospace;'
-            f'font-weight:700;font-size:0.82rem;color:{accent};'
-            f'margin-bottom:4px">{title}</div>'
-            f'<ul style="margin:0;padding-left:16px;font-size:0.76rem;'
-            f'line-height:1.45;color:var(--text-color,#16191D)">{items}</ul>'
-            f'</div>')
-    st.markdown("".join(cards), unsafe_allow_html=True)
 
 
 HYBRID_MATRIX = {
@@ -717,5 +837,5 @@ with tab_value:
                     unsafe_allow_html=True)
 
     # ---- Glossary (always visible, independent of analysis) ----
-    with st.expander("📖 Glossary — what each term means & how it moves the output"):
-        render_glossary()
+    with st.expander("📖 Glossary — valuation terms & how they move the output"):
+        render_glossary(GLOSSARY_VALUATION)
