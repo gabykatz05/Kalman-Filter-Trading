@@ -595,6 +595,8 @@ def get_fundamentals(t: str, demo: bool) -> dict:
                 "rev_growth": g,
                 "debt_to_equity": rs.uniform(20, 200),
                 "fcf": shares * price * rs.uniform(0.02, 0.07),
+                "auto_fcf": shares * price * rs.uniform(0.03, 0.07),
+                "auto_fcf_source": "median(Yahoo FCF, OCF−CapEx)",
                 "trailing_growth": g, "growth_source": "revenue growth",
                 "currency": "USD"}
 
@@ -614,6 +616,8 @@ def get_fundamentals(t: str, demo: bool) -> dict:
     fwd_pe = g("forwardPE")
     peg = g("trailingPegRatio") or info.get("pegRatio")
     proxy_g, proxy_src = resolve_growth(t, fwd_pe, peg)
+    yahoo_fcf = g("freeCashflow")
+    auto_fcf, auto_src = auto_normalize_fcf(info, yahoo_fcf)
     return {
         "name": info.get("shortName") or info.get("longName") or t,
         "price": info.get("currentPrice") or info.get("regularMarketPrice"),
@@ -627,11 +631,55 @@ def get_fundamentals(t: str, demo: bool) -> dict:
         # Rev-growth box now shows the verified proxy, never the bugged 0%
         "rev_growth": proxy_g,
         "debt_to_equity": d2e,
-        "fcf": g("freeCashflow"),
+        "fcf": yahoo_fcf,
+        "auto_fcf": auto_fcf,
+        "auto_fcf_source": auto_src,
         "trailing_growth": proxy_g,
         "growth_source": proxy_src,
         "currency": info.get("currency", "USD"),
     }
+
+
+def auto_normalize_fcf(info, yahoo_fcf):
+    """Estimate a normalized annual FCF from light info-endpoint fields,
+    robust to the timing distortions that hit info['freeCashflow'].
+
+    Priority:
+      1. OCF − |CapEx| rebuilt from components — the most principled FCF and
+         far less timing-distorted than Yahoo's freeCashflow TTM print. Used
+         as the base whenever available.
+      2. If the OCF-based figure materially EXCEEDS Yahoo's (>15%), trust it
+         (Yahoo's is the depressed one). If they're close, take their mean.
+      3. Sanity floor at 0.9 × net income when cash-flow lines are missing.
+      4. Fall back to Yahoo's figure, then None.
+    Returns (fcf_or_None, source_label).
+    """
+    def num(k):
+        v = info.get(k)
+        return float(v) if isinstance(v, (int, float)) and np.isfinite(v) else None
+
+    a = float(yahoo_fcf) if (yahoo_fcf and np.isfinite(yahoo_fcf) and yahoo_fcf > 0) else None
+    ocf, capex = num("operatingCashflow"), num("capitalExpenditures")
+    b = (ocf - abs(capex)) if (ocf and capex is not None and ocf - abs(capex) > 0) else None
+    ni = num("netIncomeToCommon") or num("netIncome")
+    c = 0.9 * ni if (ni and ni > 0) else None
+
+    if b is not None:
+        if a is None:
+            return b, "OCF−CapEx"
+        if b > a * 1.15:                     # Yahoo print is depressed
+            return b, f"OCF−CapEx (Yahoo {a/1e9:.1f}B looked depressed)"
+        return (a + b) / 2.0, "mean(Yahoo FCF, OCF−CapEx)"
+
+    if a is not None:
+        # No OCF rebuild; floor against net income if Yahoo looks low
+        if c is not None and c > a * 1.15:
+            return (a + c) / 2.0, "mean(Yahoo FCF, 0.9×NetIncome)"
+        return a, "Yahoo FCF"
+
+    if c is not None:
+        return c, "0.9×NetIncome (no cash-flow lines)"
+    return None, "Yahoo FCF"
 
 
 def resolve_growth(ticker, fwd_pe, peg):
@@ -789,18 +837,19 @@ with tab_value:
     manual_growth = st.slider("FCF growth override (% / yr)", -10, 25, 8, 1,
                               disabled=not override_on) / 100
 
-    # ---- FCF normalization (override the base FCF the DCF compounds from) ----
-    normalize_fcf = st.toggle(
-        "Normalize starting FCF", value=False,
-        help="Yahoo's freeCashflow can be depressed by one-off timing (e.g. "
-             "working-capital swings, a weak quarter). Turn on to type a "
-             "normalized annual FCF in $B — use guidance or a multi-year "
-             "average so the DCF compounds from a representative base.")
+    # ---- FCF normalization: auto by default, manual override optional ----
+    auto_norm = st.toggle(
+        "Auto-normalize starting FCF", value=True,
+        help="Automatically estimates a representative annual FCF from "
+             "multiple info-endpoint signals (Yahoo FCF, operating cash flow "
+             "minus capex, and a net-income floor) and takes the median — so "
+             "a single timing-distorted quarter can't tank the DCF. No manual "
+             "lookup needed per stock.")
     manual_fcf_b = st.number_input(
-        "Normalized FCF ($B)", min_value=0.0, value=0.0, step=0.5,
-        format="%.1f", disabled=not normalize_fcf,
-        help="Leave 0 to keep Yahoo's figure. Otherwise this $B value "
-             "replaces the starting FCF in the DCF and reverse-DCF.")
+        "Manual FCF override ($B, 0 = use auto)", min_value=0.0, value=0.0,
+        step=0.5, format="%.1f",
+        help="Optional. Type a value to override the auto estimate (e.g. "
+             "company guidance). Leave 0 to let auto-normalization decide.")
 
     analyze = st.button("Analyze fundamentals", type="primary",
                         use_container_width=True)
@@ -862,14 +911,20 @@ with tab_value:
         c8.metric("Debt/Equity", "—" if not d2e or not np.isfinite(d2e)
                   else f"{d2e/100:.2f}" if d2e > 5 else f"{d2e:.2f}")
 
-        # Effective FCF: normalized override (if on and > 0) else Yahoo's
+        # Effective FCF: manual override > auto-normalized > raw Yahoo
         yahoo_fcf = f.get("fcf")
-        if normalize_fcf and manual_fcf_b > 0:
+        auto_fcf = f.get("auto_fcf")
+        if manual_fcf_b > 0:
             eff_fcf = manual_fcf_b * 1e9
-            fcf_note = (f"normalized {manual_fcf_b:.1f}B "
-                        f"(Yahoo {yahoo_fcf/1e9:.1f}B)"
+            fcf_note = (f"manual {manual_fcf_b:.1f}B (Yahoo {yahoo_fcf/1e9:.1f}B)"
                         if yahoo_fcf and np.isfinite(yahoo_fcf)
-                        else f"normalized {manual_fcf_b:.1f}B")
+                        else f"manual {manual_fcf_b:.1f}B")
+            fcf_label = "Free cash flow*"
+        elif auto_norm and auto_fcf and np.isfinite(auto_fcf):
+            eff_fcf = auto_fcf
+            yf_str = (f", Yahoo {yahoo_fcf/1e9:.1f}B"
+                      if yahoo_fcf and np.isfinite(yahoo_fcf) else "")
+            fcf_note = f"auto {auto_fcf/1e9:.1f}B [{f.get('auto_fcf_source','')}{yf_str}]"
             fcf_label = "Free cash flow*"
         else:
             eff_fcf = yahoo_fcf
@@ -877,8 +932,9 @@ with tab_value:
             fcf_label = "Free cash flow"
         c9.metric(fcf_label, "—" if not eff_fcf or not np.isfinite(eff_fcf)
                   else f"{eff_fcf/1e9:.1f}B",
-                  help="Starting FCF the DCF compounds from. Asterisk = your "
-                       "normalized value, not Yahoo's." if fcf_note else None)
+                  help="Starting FCF the DCF compounds from. Asterisk = "
+                       "normalized (auto or manual), not raw Yahoo."
+                       if fcf_note else None)
 
         # ---------- DCF (forward) ----------
         fair = dcf_fair_value(eff_fcf, used_g, wacc, f["shares"])
