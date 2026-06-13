@@ -611,10 +611,9 @@ def get_fundamentals(t: str, demo: bool) -> dict:
         return v if v is not None else default
 
     d2e = g("debtToEquity")                      # Yahoo reports as a percent
-    rev_g = g("revenueGrowth")
     fwd_pe = g("forwardPE")
-    peg = g("trailingPegRatio")
-    proxy_g, proxy_src = smart_growth_proxy(rev_g, fwd_pe, peg)
+    peg = g("trailingPegRatio") or info.get("pegRatio")
+    proxy_g, proxy_src = resolve_growth(t, fwd_pe, peg)
     return {
         "name": info.get("shortName") or info.get("longName") or t,
         "price": info.get("currentPrice") or info.get("regularMarketPrice"),
@@ -622,50 +621,63 @@ def get_fundamentals(t: str, demo: bool) -> dict:
         "trailing_pe": g("trailingPE"),
         "forward_pe": fwd_pe,
         "ps": g("priceToSalesTrailing12Months"),
-        "peg": peg,
+        "peg": peg if peg and np.isfinite(peg) else np.nan,
         "roa": g("returnOnAssets"),
         "roe": g("returnOnEquity"),            # capital-efficiency proxy
-        "rev_growth": rev_g,
+        # Rev-growth box now shows the verified proxy, never the bugged 0%
+        "rev_growth": proxy_g,
         "debt_to_equity": d2e,
         "fcf": g("freeCashflow"),
-        # Smart proxy: revenueGrowth, or PEG-implied growth when that's broken
         "trailing_growth": proxy_g,
         "growth_source": proxy_src,
         "currency": info.get("currency", "USD"),
     }
 
 
-def smart_growth_proxy(rev_g, fwd_pe, peg):
-    """Data-validation layer for the messy info-endpoint growth field.
+def resolve_growth(ticker, fwd_pe, peg):
+    """Verified growth proxy that bypasses the bugged info['revenueGrowth'].
 
-    Yahoo's revenueGrowth is often 0% / stale / inconsistent with PEG. When
-    it's missing, ~0, or conflicts with PEG, fall back to the analyst growth
-    implied by PEG itself:  implied growth = (forward P/E) / PEG / 100.
-
-    (PEG = P/E ÷ growth%, so growth% = P/E ÷ PEG; ÷100 → decimal.)
+    Priority:
+      1. PEG-implied analyst growth = (forward P/E / PEG) / 100  — the cleanest
+         forward consensus signal available from the light info endpoint.
+      2. Fallback: YoY growth from quarterly_financials (Total Revenue, latest
+         quarter vs same quarter a year ago, i.e. Q_t vs Q_t-4). This DOES hit
+         the heavier statements endpoint, so it's lazy (only when step 1 fails)
+         and fully guarded — a rate-limit returns a default, never crashes.
+      3. Default +5% if both are unavailable.
     Returns (growth_decimal, human_source_label).
     """
-    def implied():
-        if (fwd_pe and np.isfinite(fwd_pe) and fwd_pe > 0
-                and peg and np.isfinite(peg) and peg > 0):
-            return float(np.clip(fwd_pe / peg / 100.0, -0.10, 0.25))
-        return None
+    # --- 1. PEG-implied (primary) ---
+    if (fwd_pe and np.isfinite(fwd_pe) and fwd_pe > 0
+            and peg and np.isfinite(peg) and peg > 0):
+        imp = float(np.clip(fwd_pe / peg / 100.0, -0.10, 0.25))
+        return imp, "PEG-implied analyst growth"
 
-    imp = implied()
-    rev_ok = rev_g is not None and np.isfinite(rev_g)
+    # --- 2. Quarterly YoY from statements (secondary, guarded) ---
+    try:
+        qf = yf.Ticker(ticker).quarterly_financials
+        if qf is not None and not qf.empty:
+            row = None
+            for name in ("Total Revenue", "TotalRevenue", "Operating Revenue"):
+                if name in qf.index:
+                    row = qf.loc[name].dropna()
+                    break
+            # Columns are most-recent-first; need >=5 quarters for true YoY
+            if row is not None and len(row) >= 5 and row.iloc[4]:
+                yoy = float(row.iloc[0] / row.iloc[4] - 1.0)
+                return (float(np.clip(yoy, -0.10, 0.25)),
+                        "quarterly YoY revenue (statements)")
+            # Fallback to sequential QoQ annualised if only 2 quarters exist
+            if row is not None and len(row) >= 2 and row.iloc[1]:
+                qoq = float(row.iloc[0] / row.iloc[1] - 1.0)
+                ann = (1 + qoq) ** 4 - 1
+                return (float(np.clip(ann, -0.10, 0.25)),
+                        "QoQ-annualised revenue (statements)")
+    except Exception:
+        pass  # rate-limited or unavailable — fall through to default
 
-    # Case 1: revenueGrowth missing or ~0 -> use implied if available
-    if not rev_ok or abs(rev_g) < 0.005:
-        if imp is not None:
-            return imp, "PEG-implied (Yahoo revenue growth was ~0/blank)"
-        return (rev_g if rev_ok else 0.05), "revenue growth"
-
-    # Case 2: heavy conflict between revenueGrowth and PEG-implied (>10pp apart)
-    if imp is not None and abs(rev_g - imp) > 0.10:
-        return imp, f"PEG-implied (conflict: revenue growth {rev_g:+.0%})"
-
-    # Case 3: revenueGrowth looks usable
-    return float(np.clip(rev_g, -0.10, 0.25)), "revenue growth"
+    # --- 3. Final default ---
+    return 0.05, "default +5% (no PEG or statements available)"
 
 
 def market_implied_growth(price, fcf0, wacc, shares, g_term=0.025, years=5):
@@ -828,7 +840,11 @@ with tab_value:
         c6.metric("ROA", rt(f.get("roa")))
 
         c7, c8, c9 = st.columns(3)
-        c7.metric("Rev growth", pc(f.get("rev_growth")))
+        c7.metric("Growth proxy", pc(f.get("rev_growth")),
+                  help=f"Verified growth, source: {f.get('growth_source','—')}. "
+                       "Bypasses Yahoo's bugged revenueGrowth field — uses "
+                       "PEG-implied analyst growth, or quarterly YoY revenue "
+                       "from statements as fallback.")
         d2e = f.get("debt_to_equity")
         c8.metric("Debt/Equity", "—" if not d2e or not np.isfinite(d2e)
                   else f"{d2e/100:.2f}" if d2e > 5 else f"{d2e:.2f}")
