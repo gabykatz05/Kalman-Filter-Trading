@@ -789,6 +789,19 @@ with tab_value:
     manual_growth = st.slider("FCF growth override (% / yr)", -10, 25, 8, 1,
                               disabled=not override_on) / 100
 
+    # ---- FCF normalization (override the base FCF the DCF compounds from) ----
+    normalize_fcf = st.toggle(
+        "Normalize starting FCF", value=False,
+        help="Yahoo's freeCashflow can be depressed by one-off timing (e.g. "
+             "working-capital swings, a weak quarter). Turn on to type a "
+             "normalized annual FCF in $B — use guidance or a multi-year "
+             "average so the DCF compounds from a representative base.")
+    manual_fcf_b = st.number_input(
+        "Normalized FCF ($B)", min_value=0.0, value=0.0, step=0.5,
+        format="%.1f", disabled=not normalize_fcf,
+        help="Leave 0 to keep Yahoo's figure. Otherwise this $B value "
+             "replaces the starting FCF in the DCF and reverse-DCF.")
+
     analyze = st.button("Analyze fundamentals", type="primary",
                         use_container_width=True)
 
@@ -848,17 +861,32 @@ with tab_value:
         d2e = f.get("debt_to_equity")
         c8.metric("Debt/Equity", "—" if not d2e or not np.isfinite(d2e)
                   else f"{d2e/100:.2f}" if d2e > 5 else f"{d2e:.2f}")
-        fcf = f.get("fcf")
-        c9.metric("Free cash flow", "—" if not fcf or not np.isfinite(fcf)
-                  else f"{fcf/1e9:.1f}B")
+
+        # Effective FCF: normalized override (if on and > 0) else Yahoo's
+        yahoo_fcf = f.get("fcf")
+        if normalize_fcf and manual_fcf_b > 0:
+            eff_fcf = manual_fcf_b * 1e9
+            fcf_note = (f"normalized {manual_fcf_b:.1f}B "
+                        f"(Yahoo {yahoo_fcf/1e9:.1f}B)"
+                        if yahoo_fcf and np.isfinite(yahoo_fcf)
+                        else f"normalized {manual_fcf_b:.1f}B")
+            fcf_label = "Free cash flow*"
+        else:
+            eff_fcf = yahoo_fcf
+            fcf_note = None
+            fcf_label = "Free cash flow"
+        c9.metric(fcf_label, "—" if not eff_fcf or not np.isfinite(eff_fcf)
+                  else f"{eff_fcf/1e9:.1f}B",
+                  help="Starting FCF the DCF compounds from. Asterisk = your "
+                       "normalized value, not Yahoo's." if fcf_note else None)
 
         # ---------- DCF (forward) ----------
-        fair = dcf_fair_value(f.get("fcf"), used_g, wacc, f["shares"])
+        fair = dcf_fair_value(eff_fcf, used_g, wacc, f["shares"])
         upside = (fair / f["price"] - 1) if fair else None
 
         # ---------- reverse DCF: growth the market is pricing in ----------
         mig, mig_capped = market_implied_growth(
-            f.get("price"), f.get("fcf"), wacc, f["shares"])
+            f.get("price"), eff_fcf, wacc, f["shares"])
 
         if fair:
             verdict = ("Undervalued" if upside > 0.20 else
@@ -907,8 +935,9 @@ with tab_value:
                       help="How much more (or less) growth the market is "
                            "pricing in versus the growth you fed the DCF.")
 
+            fcf_caption = f" · FCF base: {fcf_note}" if fcf_note else ""
             st.markdown(f'<div class="sub">Growth assumption: {g_source} · '
-                        f'fading to 2.5% · WACC {wacc:.1%}</div>',
+                        f'fading to 2.5% · WACC {wacc:.1%}{fcf_caption}</div>',
                         unsafe_allow_html=True)
             st.markdown(f'<div class="sub">Scorecard {pts}/10 · {notes}</div>',
                         unsafe_allow_html=True)
