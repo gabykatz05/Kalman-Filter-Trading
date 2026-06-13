@@ -202,6 +202,16 @@ GLOSSARY_VALUATION = [
         "<b>ROIC is more reliable</b> for these names — read a sky-high ROE as "
         "a balance-sheet artifact, not 100%+ returns on capital.",
     ]),
+    ("Market-Implied Growth (Reverse DCF)", C_HOLD, [
+        "Runs the DCF <b>backwards</b>: instead of guessing growth to find "
+        "value, it solves for the FCF growth rate that makes fair value equal "
+        "<b>today's price</b>.",
+        "If it's <b>above</b> your own assumption, the market is more "
+        "optimistic than you — the stock needs that growth to <i>justify</i> "
+        "its price.",
+        "Best single check for hype: e.g. a name pricing in 20%+ when it grows "
+        "revenue ~5% is leaning hard on multiple expansion.",
+    ]),
     ("Scorecard & Verdict", C_HOLD, [
         "A 0–10 cross-check on the DCF scoring ROE, P/E, PEG and revenue "
         "growth — guards against a single bad input swinging the verdict.",
@@ -585,7 +595,8 @@ def get_fundamentals(t: str, demo: bool) -> dict:
                 "rev_growth": g,
                 "debt_to_equity": rs.uniform(20, 200),
                 "fcf": shares * price * rs.uniform(0.02, 0.07),
-                "trailing_growth": g, "currency": "USD"}
+                "trailing_growth": g, "growth_source": "revenue growth",
+                "currency": "USD"}
 
     if yf is None:
         raise ImportError("yfinance is required for live fundamentals.")
@@ -600,23 +611,88 @@ def get_fundamentals(t: str, demo: bool) -> dict:
         return v if v is not None else default
 
     d2e = g("debtToEquity")                      # Yahoo reports as a percent
+    rev_g = g("revenueGrowth")
+    fwd_pe = g("forwardPE")
+    peg = g("trailingPegRatio")
+    proxy_g, proxy_src = smart_growth_proxy(rev_g, fwd_pe, peg)
     return {
         "name": info.get("shortName") or info.get("longName") or t,
         "price": info.get("currentPrice") or info.get("regularMarketPrice"),
         "shares": info.get("sharesOutstanding"),
         "trailing_pe": g("trailingPE"),
-        "forward_pe": g("forwardPE"),
+        "forward_pe": fwd_pe,
         "ps": g("priceToSalesTrailing12Months"),
-        "peg": g("trailingPegRatio"),
+        "peg": peg,
         "roa": g("returnOnAssets"),
         "roe": g("returnOnEquity"),            # capital-efficiency proxy
-        "rev_growth": g("revenueGrowth"),
+        "rev_growth": rev_g,
         "debt_to_equity": d2e,
         "fcf": g("freeCashflow"),
-        # Revenue growth is the best forward-growth proxy available from info
-        "trailing_growth": g("revenueGrowth"),
+        # Smart proxy: revenueGrowth, or PEG-implied growth when that's broken
+        "trailing_growth": proxy_g,
+        "growth_source": proxy_src,
         "currency": info.get("currency", "USD"),
     }
+
+
+def smart_growth_proxy(rev_g, fwd_pe, peg):
+    """Data-validation layer for the messy info-endpoint growth field.
+
+    Yahoo's revenueGrowth is often 0% / stale / inconsistent with PEG. When
+    it's missing, ~0, or conflicts with PEG, fall back to the analyst growth
+    implied by PEG itself:  implied growth = (forward P/E) / PEG / 100.
+
+    (PEG = P/E ÷ growth%, so growth% = P/E ÷ PEG; ÷100 → decimal.)
+    Returns (growth_decimal, human_source_label).
+    """
+    def implied():
+        if (fwd_pe and np.isfinite(fwd_pe) and fwd_pe > 0
+                and peg and np.isfinite(peg) and peg > 0):
+            return float(np.clip(fwd_pe / peg / 100.0, -0.10, 0.25))
+        return None
+
+    imp = implied()
+    rev_ok = rev_g is not None and np.isfinite(rev_g)
+
+    # Case 1: revenueGrowth missing or ~0 -> use implied if available
+    if not rev_ok or abs(rev_g) < 0.005:
+        if imp is not None:
+            return imp, "PEG-implied (Yahoo revenue growth was ~0/blank)"
+        return (rev_g if rev_ok else 0.05), "revenue growth"
+
+    # Case 2: heavy conflict between revenueGrowth and PEG-implied (>10pp apart)
+    if imp is not None and abs(rev_g - imp) > 0.10:
+        return imp, f"PEG-implied (conflict: revenue growth {rev_g:+.0%})"
+
+    # Case 3: revenueGrowth looks usable
+    return float(np.clip(rev_g, -0.10, 0.25)), "revenue growth"
+
+
+def market_implied_growth(price, fcf0, wacc, shares, g_term=0.025, years=5):
+    """Reverse DCF: solve for the constant-start growth rate g0 (fading to
+    g_term) that makes dcf_fair_value == current market price.
+
+    Searches within the SAME [-10%, +25%] band the forward DCF clips to, so
+    the answer is comparable. Returns (growth, capped_flag):
+      capped_flag True  -> price is richer than even +25% start growth allows
+                           (the model structurally can't justify it — the
+                            Apple/quality-compounder case).
+    """
+    if not price or not fcf0 or fcf0 <= 0 or not shares or wacc <= g_term:
+        return None, False
+    lo, hi = -0.10, 0.25                      # same clip as dcf_fair_value
+    f = lambda g: (dcf_fair_value(fcf0, g, wacc, shares, g_term, years) or 0)
+    if f(hi) < price:                         # even max growth underprices it
+        return hi, True
+    if f(lo) > price:                         # even shrinking overprices it
+        return lo, False
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if f(mid) > price:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2, False
 
 
 def dcf_fair_value(fcf0, g0, wacc, shares, g_term=0.025, years=5):
@@ -719,18 +795,18 @@ with tab_value:
 
         # ---------- which growth rate feeds the DCF ----------
         hist_g = f.get("trailing_growth", np.nan)
+        proxy_src = f.get("growth_source", "revenue growth")
         if override_on:
             used_g = manual_growth
             g_source = (f"manual override <b>{manual_growth:+.0%}</b> "
-                        f"(historical proxy {hist_g:+.0%})"
+                        f"(auto proxy {hist_g:+.0%} · {proxy_src})"
                         if np.isfinite(hist_g) else
                         f"manual override <b>{manual_growth:+.0%}</b>")
         else:
             used_g = hist_g if np.isfinite(hist_g) else 0.05
-            g_source = (f"historical proxy <b>{hist_g:+.0%}</b> "
-                        f"(Yahoo revenue growth)"
+            g_source = (f"auto proxy <b>{hist_g:+.0%}</b> ({proxy_src})"
                         if np.isfinite(hist_g) else
-                        "default <b>+5%</b> (no Yahoo growth field)")
+                        "default <b>+5%</b> (no usable Yahoo growth field)")
 
         # ---------- fundamentals row 1: valuation ----------
         st.markdown(f'<span class="tkr">{f["name"]}</span>'
@@ -760,9 +836,13 @@ with tab_value:
         c9.metric("Free cash flow", "—" if not fcf or not np.isfinite(fcf)
                   else f"{fcf/1e9:.1f}B")
 
-        # ---------- DCF ----------
+        # ---------- DCF (forward) ----------
         fair = dcf_fair_value(f.get("fcf"), used_g, wacc, f["shares"])
         upside = (fair / f["price"] - 1) if fair else None
+
+        # ---------- reverse DCF: growth the market is pricing in ----------
+        mig, mig_capped = market_implied_growth(
+            f.get("price"), f.get("fcf"), wacc, f["shares"])
 
         if fair:
             verdict = ("Undervalued" if upside > 0.20 else
@@ -787,6 +867,30 @@ with tab_value:
             d1.metric("Price", f'{f["price"]:.2f}')
             d2.metric("DCF fair value", "—" if not fair else f"{fair:.2f}")
             d3.metric("Upside", "—" if upside is None else f"{upside:+.0%}")
+
+            # Reverse-DCF KPI: what growth justifies today's price?
+            e1, e2 = st.columns(2)
+            if mig is None:
+                mig_str, gap_str = "—", "—"
+            elif mig_capped:
+                mig_str = ">25%"
+                gap_str = "beyond model"
+            else:
+                mig_str = f"{mig:+.1%}"
+                gap = mig - used_g
+                gap_str = f"{gap:+.1%} vs your {used_g:+.0%}"
+            e1.metric("Market-implied growth", mig_str,
+                      help="Reverse DCF: the constant starting FCF growth "
+                           "(fading to 2.5%) that makes fair value equal "
+                           "today's price, at the current WACC. '>25%' means "
+                           "the price needs more growth than the model's cap "
+                           "allows — it's priced on multiple/quality, not FCF "
+                           "growth alone. Above your assumption = market more "
+                           "optimistic than you.")
+            e2.metric("Implied vs assumed", gap_str,
+                      help="How much more (or less) growth the market is "
+                           "pricing in versus the growth you fed the DCF.")
+
             st.markdown(f'<div class="sub">Growth assumption: {g_source} · '
                         f'fading to 2.5% · WACC {wacc:.1%}</div>',
                         unsafe_allow_html=True)
