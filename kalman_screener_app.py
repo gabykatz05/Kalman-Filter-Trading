@@ -103,16 +103,16 @@ def make_demo(tickers: list[str], interval: str = "1d"
     """Synthetic OHLCV so the app works with no internet (any interval)."""
     ppy = ktf.periods_per_year(interval)
     if interval == "1d":
-        n = 520
-        idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n)
+        idx = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=520)
         bar_vol, hl = 0.013, 0.008
     else:
-        n = 60 * (ppy // 252)                       # ~60 sessions of bars
+        n_req = 60 * (ppy // 252)                   # ~60 sessions of bars
         freq = {"1h": "1h", "15m": "15min"}.get(interval, "15min")
         idx = pd.date_range(end=pd.Timestamp.now().floor("min"),
-                            periods=n, freq=freq)
+                            periods=n_req, freq=freq)
         bar_vol = 0.013 * np.sqrt(252 / ppy)        # scale noise to bar size
         hl = bar_vol * 0.6
+    n = len(idx)                                    # source of truth for length
     out = {}
     for i, t in enumerate(tickers):
         rs = np.random.RandomState(100 + i)
@@ -351,103 +351,95 @@ def _row(df, *names):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_fundamentals(t: str, demo: bool) -> dict:
-    """ROIC, P/E, FCF history/growth, net debt, shares, price."""
+    """Core metrics from the lightweight `ticker.info` endpoint only.
+
+    Avoids ticker.financials / .balance_sheet / .cashflow, which hit a
+    heavier endpoint that Yahoo rate-limits hard on shared servers.
+    """
     if demo:
-        rs = np.random.RandomState(abs(hash(t)) % (2**31))
+        rs = np.random.RandomState(abs(hash(t)) % (2 ** 31))
         shares = rs.uniform(0.5, 8) * 1e9
         price = rs.uniform(40, 400)
-        fcf0 = shares * price * rs.uniform(0.02, 0.07)      # FCF yield 2-7%
         g = rs.uniform(-0.05, 0.22)
-        fcf_hist = [fcf0 / (1 + g) ** k for k in range(4)]   # newest first
         return {"name": f"{t} (demo)", "price": price, "shares": shares,
-                "pe": rs.uniform(11, 42), "roic": rs.uniform(0.04, 0.30),
-                "fcf": fcf_hist, "fcf_growth": g,
-                "net_debt": shares * price * rs.uniform(-0.05, 0.25),
-                "currency": "USD"}
+                "trailing_pe": rs.uniform(11, 42),
+                "forward_pe": rs.uniform(10, 35),
+                "ps": rs.uniform(1.5, 12),
+                "peg": rs.uniform(0.6, 3.5),
+                "roa": rs.uniform(0.02, 0.22),
+                "roe": rs.uniform(0.08, 0.55),
+                "rev_growth": g,
+                "debt_to_equity": rs.uniform(20, 200),
+                "fcf": shares * price * rs.uniform(0.02, 0.07),
+                "trailing_growth": g, "currency": "USD"}
 
     if yf is None:
         raise ImportError("yfinance is required for live fundamentals.")
-    tk = yf.Ticker(t)
-    info = tk.info or {}
-    inc, bs, cf = tk.income_stmt, tk.balance_sheet, tk.cashflow
 
-    fcf_ser = _row(cf, "Free Cash Flow")
-    ebit = _row(inc, "EBIT", "Operating Income")
-    tax = _row(inc, "Tax Provision")
-    pretax = _row(inc, "Pretax Income")
-    ic = _row(bs, "Invested Capital")
-    debt = _row(bs, "Total Debt")
-    equity = _row(bs, "Stockholders Equity",
-                  "Total Equity Gross Minority Interest")
-    cash = _row(bs, "Cash And Cash Equivalents",
-                "Cash Cash Equivalents And Short Term Investments")
+    try:
+        info = yf.Ticker(t).info or {}
+    except Exception as e:
+        raise RuntimeError(f"info endpoint failed: {e}")
 
-    # --- ROIC = NOPAT / Invested Capital ---
-    tax_rate = 0.21
-    if tax is not None and pretax is not None and pretax.iloc[0]:
-        tax_rate = float(np.clip(tax.iloc[0] / pretax.iloc[0], 0.0, 0.35))
-    roic = np.nan
-    icap = None
-    if ic is not None:
-        icap = float(ic.iloc[0])
-    elif debt is not None and equity is not None:
-        icap = float(debt.iloc[0] + equity.iloc[0]
-                     - (cash.iloc[0] if cash is not None else 0.0))
-    if ebit is not None and icap:
-        roic = float(ebit.iloc[0]) * (1 - tax_rate) / icap
+    def g(key, default=np.nan):
+        v = info.get(key, default)
+        return v if v is not None else default
 
-    # --- FCF growth: CAGR across available annual statements ---
-    fcf_hist, fcf_g = [], np.nan
-    if fcf_ser is not None:
-        fcf_hist = [float(v) for v in fcf_ser.values]        # newest first
-        if len(fcf_hist) >= 2 and fcf_hist[-1] > 0 and fcf_hist[0] > 0:
-            yrs = len(fcf_hist) - 1
-            fcf_g = (fcf_hist[0] / fcf_hist[-1]) ** (1 / yrs) - 1
-
-    net_debt = 0.0
-    if debt is not None:
-        net_debt = float(debt.iloc[0]
-                         - (cash.iloc[0] if cash is not None else 0.0))
-
-    return {"name": info.get("shortName", t),
-            "price": info.get("currentPrice") or info.get("regularMarketPrice"),
-            "shares": info.get("sharesOutstanding"),
-            "pe": info.get("trailingPE"),
-            "roic": roic, "fcf": fcf_hist, "fcf_growth": fcf_g,
-            "net_debt": net_debt,
-            "currency": info.get("currency", "USD")}
+    d2e = g("debtToEquity")                      # Yahoo reports as a percent
+    return {
+        "name": info.get("shortName") or info.get("longName") or t,
+        "price": info.get("currentPrice") or info.get("regularMarketPrice"),
+        "shares": info.get("sharesOutstanding"),
+        "trailing_pe": g("trailingPE"),
+        "forward_pe": g("forwardPE"),
+        "ps": g("priceToSalesTrailing12Months"),
+        "peg": g("trailingPegRatio"),
+        "roa": g("returnOnAssets"),
+        "roe": g("returnOnEquity"),            # capital-efficiency proxy
+        "rev_growth": g("revenueGrowth"),
+        "debt_to_equity": d2e,
+        "fcf": g("freeCashflow"),
+        # Revenue growth is the best forward-growth proxy available from info
+        "trailing_growth": g("revenueGrowth"),
+        "currency": info.get("currency", "USD"),
+    }
 
 
-def dcf_fair_value(fcf0, g0, wacc, shares, net_debt,
-                   g_term=0.025, years=5):
-    """5y explicit FCF with growth fading to terminal, Gordon TV."""
+def dcf_fair_value(fcf0, g0, wacc, shares, g_term=0.025, years=5):
+    """5y explicit FCF with growth fading linearly to a terminal rate,
+    Gordon terminal value. Equity value per share (net debt omitted —
+    the lightweight info endpoint has no reliable balance-sheet cash)."""
     if not fcf0 or fcf0 <= 0 or not shares or wacc <= g_term:
         return None
-    g0 = float(np.clip(g0 if np.isfinite(g0) else 0.05, -0.05, 0.25))
+    g0 = float(np.clip(g0 if np.isfinite(g0) else 0.05, -0.10, 0.25))
     pv, fcf = 0.0, fcf0
     for k in range(1, years + 1):
         g_k = g0 + (g_term - g0) * (k - 1) / (years - 1)     # linear fade
         fcf *= (1 + g_k)
         pv += fcf / (1 + wacc) ** k
     tv = fcf * (1 + g_term) / (wacc - g_term) / (1 + wacc) ** years
-    return (pv + tv - net_debt) / shares
+    return (pv + tv) / shares
 
 
 def scorecard(f, upside):
-    """0-8 multi-factor score as a cross-check on the DCF."""
+    """0-10 multi-factor score as a cross-check on the DCF (info fields)."""
     pts, notes = 0, []
-    r = f.get("roic")
-    if r is not None and np.isfinite(r):
-        pts += 2 if r > 0.15 else 1 if r > 0.08 else 0
-        notes.append(f"ROIC {r:.0%}")
-    pe = f.get("pe")
+    roe = f.get("roe")
+    if roe is not None and np.isfinite(roe):
+        pts += 2 if roe > 0.20 else 1 if roe > 0.10 else 0
+        notes.append(f"ROE {roe:.0%}")
+    pe = f.get("trailing_pe")
     if pe and np.isfinite(pe) and pe > 0:
         pts += 2 if pe < 18 else 1 if pe < 28 else 0
         notes.append(f"P/E {pe:.1f}")
-    g = f.get("fcf_growth")
-    if g is not None and np.isfinite(g):
-        pts += 2 if g > 0.12 else 1 if g > 0.04 else 0
-        notes.append(f"FCF growth {g:+.0%}")
+    peg = f.get("peg")
+    if peg and np.isfinite(peg) and peg > 0:
+        pts += 2 if peg < 1.0 else 1 if peg < 2.0 else 0
+        notes.append(f"PEG {peg:.2f}")
+    rg = f.get("rev_growth")
+    if rg is not None and np.isfinite(rg):
+        pts += 2 if rg > 0.12 else 1 if rg > 0.04 else 0
+        notes.append(f"Rev growth {rg:+.0%}")
     if upside is not None:
         pts += 2 if upside > 0.20 else 1 if upside > 0 else 0
     return pts, " · ".join(notes)
@@ -477,44 +469,83 @@ HYBRID_MATRIX = {
 
 with tab_value:
     st.markdown('<div class="sub" style="margin:4px 0 8px">Structural 1-5y '
-                'view: yfinance fundamentals + simplified DCF, cross-checked '
-                'against the medium-term Kalman trend.</div>',
-                unsafe_allow_html=True)
+                'view: lightweight Yahoo <code>info</code> fundamentals + '
+                'simplified DCF, cross-checked against the medium-term '
+                'Kalman trend.</div>', unsafe_allow_html=True)
 
     default_t = tickers[0] if tickers else "AAPL"
     val_ticker = st.text_input("Ticker to value", value=default_t).strip().upper()
     wacc = st.slider("Discount rate / WACC (%)", 6.0, 14.0, 9.0, 0.5) / 100
+
+    # ---- FCF growth override ----
+    override_on = st.toggle("Override FCF growth manually", value=False,
+                            help="Off = use the trailing revenue-growth "
+                                 "proxy from Yahoo. On = use your slider value "
+                                 "for the 5-year DCF projection.")
+    manual_growth = st.slider("FCF growth override (% / yr)", -10, 25, 8, 1,
+                              disabled=not override_on) / 100
+
     analyze = st.button("Analyze fundamentals", type="primary",
                         use_container_width=True)
 
     if analyze and val_ticker:
         try:
-            with st.spinner(f"Fetching {val_ticker} financial statements..."):
+            with st.spinner(f"Fetching {val_ticker} (info endpoint)..."):
                 f = get_fundamentals(val_ticker, demo)
         except Exception as e:
             st.error(f"Could not load fundamentals for {val_ticker}: {e}")
             st.stop()
 
         if not f.get("price") or not f.get("shares"):
-            st.error(f"{val_ticker}: missing price/share data — "
-                     "ETFs and some foreign listings have no statements.")
+            st.error(f"{val_ticker}: no price/share data — "
+                     "ETFs and some foreign listings aren't covered.")
             st.stop()
 
-        # ---------- fundamentals ----------
+        # ---------- which growth rate feeds the DCF ----------
+        hist_g = f.get("trailing_growth", np.nan)
+        if override_on:
+            used_g = manual_growth
+            g_source = (f"manual override <b>{manual_growth:+.0%}</b> "
+                        f"(historical proxy {hist_g:+.0%})"
+                        if np.isfinite(hist_g) else
+                        f"manual override <b>{manual_growth:+.0%}</b>")
+        else:
+            used_g = hist_g if np.isfinite(hist_g) else 0.05
+            g_source = (f"historical proxy <b>{hist_g:+.0%}</b> "
+                        f"(Yahoo revenue growth)"
+                        if np.isfinite(hist_g) else
+                        "default <b>+5%</b> (no Yahoo growth field)")
+
+        # ---------- fundamentals row 1: valuation ----------
         st.markdown(f'<span class="tkr">{f["name"]}</span>'
                     f'<div class="sub">Trailing fundamentals · '
-                    f'{f["currency"]}</div>', unsafe_allow_html=True)
+                    f'{f["currency"]} · source: info endpoint</div>',
+                    unsafe_allow_html=True)
+        pe = lambda v: "—" if not v or not np.isfinite(v) else f"{v:.1f}"
+        pc = lambda v: "—" if v is None or not np.isfinite(v) else f"{v:+.1%}"
+        rt = lambda v: "—" if v is None or not np.isfinite(v) else f"{v:.1%}"
+
         c1, c2, c3 = st.columns(3)
-        c1.metric("ROIC", "—" if not np.isfinite(f.get("roic", np.nan))
-                  else f'{f["roic"]:.1%}')
-        c2.metric("P/E (ttm)", "—" if not f.get("pe") else f'{f["pe"]:.1f}')
-        c3.metric("FCF growth", "—" if not np.isfinite(f.get("fcf_growth", np.nan))
-                  else f'{f["fcf_growth"]:+.1%}')
+        c1.metric("P/E (ttm)", pe(f.get("trailing_pe")))
+        c2.metric("Forward P/E", pe(f.get("forward_pe")))
+        c3.metric("P/S (ttm)", pe(f.get("ps")))
+
+        c4, c5, c6 = st.columns(3)
+        c4.metric("PEG", pe(f.get("peg")))
+        c5.metric("ROE", rt(f.get("roe")))
+        c6.metric("ROA", rt(f.get("roa")))
+
+        c7, c8, c9 = st.columns(3)
+        c7.metric("Rev growth", pc(f.get("rev_growth")))
+        d2e = f.get("debt_to_equity")
+        c8.metric("Debt/Equity", "—" if not d2e or not np.isfinite(d2e)
+                  else f"{d2e/100:.2f}" if d2e > 5 else f"{d2e:.2f}")
+        fcf = f.get("fcf")
+        c9.metric("Free cash flow", "—" if not fcf or not np.isfinite(fcf)
+                  else f"{fcf/1e9:.1f}B")
 
         # ---------- DCF ----------
-        fcf0 = f["fcf"][0] if f.get("fcf") else None
-        fair = dcf_fair_value(fcf0, f.get("fcf_growth", 0.05), wacc,
-                              f["shares"], f.get("net_debt", 0.0))
+        fair = dcf_fair_value(f.get("fcf"), used_g, wacc, f["shares"])
         upside = (fair / f["price"] - 1) if fair else None
 
         if fair:
@@ -522,9 +553,10 @@ with tab_value:
                        "Overvalued" if upside < -0.15 else "Fairly Valued")
         else:
             pts, _ = scorecard(f, None)
-            verdict = ("Undervalued" if pts >= 5 else
-                       "Overvalued" if pts <= 1 else "Fairly Valued")
-            st.info("FCF unavailable — verdict from the factor scorecard only.")
+            verdict = ("Undervalued" if pts >= 6 else
+                       "Overvalued" if pts <= 2 else "Fairly Valued")
+            st.info("Free cash flow unavailable — verdict from the factor "
+                    "scorecard only.")
 
         pts, notes = scorecard(f, upside)
         v_color = {"Undervalued": C_BUY, "Overvalued": C_SELL,
@@ -539,8 +571,11 @@ with tab_value:
             d1.metric("Price", f'{f["price"]:.2f}')
             d2.metric("DCF fair value", "—" if not fair else f"{fair:.2f}")
             d3.metric("Upside", "—" if upside is None else f"{upside:+.0%}")
-            st.markdown(f'<div class="sub">Scorecard {pts}/8 · {notes} · '
-                        f'WACC {wacc:.1%}</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="sub">Growth assumption: {g_source} · '
+                        f'fading to 2.5% · WACC {wacc:.1%}</div>',
+                        unsafe_allow_html=True)
+            st.markdown(f'<div class="sub">Scorecard {pts}/10 · {notes}</div>',
+                        unsafe_allow_html=True)
 
         # ---------- medium-term Kalman view (always daily, 2y) ----------
         with st.spinner("Computing medium-term Kalman trend (daily, 2y)..."):
@@ -579,6 +614,8 @@ with tab_value:
                         unsafe_allow_html=True)
 
         st.markdown('<div class="sub" style="margin-top:10px">Simplified '
-                    'model on trailing statements — earnings quality, '
-                    'cyclicality and guidance are not captured. '
-                    'Not investment advice.</div>', unsafe_allow_html=True)
+                    'model on Yahoo summary fields — revenue growth is a '
+                    'proxy for FCF growth, net debt is omitted, and earnings '
+                    'quality / guidance are not captured. Use the override '
+                    'to stress-test. Not investment advice.</div>',
+                    unsafe_allow_html=True)
