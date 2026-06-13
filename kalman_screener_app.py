@@ -445,6 +445,102 @@ def scorecard(f, upside):
     return pts, " · ".join(notes)
 
 
+# ------------------------------------------------------------------ glossary
+GLOSSARY = [
+    ("WACC / Discount Rate", C_KF, [
+        "The annual rate used to discount future cash flows back to today — "
+        "the return you demand for the risk taken.",
+        "<b>Lower WACC → higher fair value</b> (future cash worth more today); "
+        "<b>higher WACC → lower fair value</b>.",
+        "It also sets the exit multiple: high-quality megacaps arguably "
+        "deserve a <b>lower</b> WACC (~7%) than the 9% default.",
+    ]),
+    ("FCF Growth Override", C_KF, [
+        "Bypasses the historical / analyst growth estimate and applies "
+        "<b>your own</b> annual free-cash-flow growth assumption.",
+        "Off → uses Yahoo's trailing revenue growth as a proxy. "
+        "On → uses your slider value for the full 5-year projection.",
+        "Use it to <b>stress-test</b>: the caption always shows both the rate "
+        "in use and the historical baseline for comparison.",
+    ]),
+    ("Fade to 2.5% (Fade Mechanism)", C_KF, [
+        "The model does <b>not</b> hold the starting growth rate flat. It "
+        "decays it <b>linearly</b> toward the 2.5% terminal rate over 5 years.",
+        "Example: a +17% start steps down roughly 17 → 14 → 11 → 8 → 2.5%.",
+        "This mirrors reality — <b>no company compounds at peak growth "
+        "forever</b>; competition and scale pull it toward the economy's rate.",
+    ]),
+    ("Terminal Growth & Terminal Multiple", C_HOLD, [
+        "<b>Terminal growth</b> (2.5%) = the perpetual rate cash flows grow "
+        "after year 5, roughly long-run nominal GDP.",
+        "The Gordon formula locks in the <b>exit multiple = 1 / (WACC − "
+        "terminal growth)</b>. At 9% / 2.5% that's ~15.8× FCF.",
+        "This is why the DCF is anchored: change WACC or terminal growth and "
+        "the entire valuation re-prices through that multiple.",
+    ]),
+    ("DCF Fair Value vs. Market Price", C_HOLD, [
+        "<b>Fair value</b> = present value of 5 years of projected FCF + the "
+        "discounted terminal value, divided by shares.",
+        "A strict DCF is <b>structurally conservative</b>: it caps the exit "
+        "multiple and won't extrapolate hyper-growth beyond the window.",
+        "The market often pays far more (e.g. ~43× FCF for Apple), pricing in "
+        "lower risk or longer growth — the gap is a <b>question to "
+        "investigate</b>, not proof of mispricing.",
+    ]),
+    ("Medium-Term (Kalman) Drift", C_BUY, [
+        "The Kalman filter strips daily noise from price to estimate the "
+        "<b>true underlying trend</b> — a lag-free moving average.",
+        "<b>Drift</b> = that trend's annualised slope. Positive = structural "
+        "uptrend; negative = downtrend.",
+        "It's a <b>momentum overlay</b> on the fundamental view: the matrix "
+        "crosses 'is it cheap?' (DCF) with 'is it trending?' (Kalman).",
+    ]),
+    ("ROE — Megacap Caution", C_SELL, [
+        "Return on Equity = net income ÷ shareholder equity. Normally a "
+        "quality gauge — but <b>distorted by buybacks</b>.",
+        "Heavy repurchases (Apple) <b>shrink book equity toward zero</b>, "
+        "inflating the denominator's effect and pushing ROE to 100%+.",
+        "<b>ROIC is more reliable</b> for these names — read a sky-high ROE as "
+        "a balance-sheet artifact, not 100%+ returns on capital.",
+    ]),
+    ("Scorecard & Verdict", C_HOLD, [
+        "A 0–10 cross-check on the DCF scoring ROE, P/E, PEG and revenue "
+        "growth — guards against a single bad input swinging the verdict.",
+        "<b>Undervalued</b> = DCF upside &gt; +20%; <b>Overvalued</b> = "
+        "downside &gt; 15%; otherwise <b>Fairly Valued</b> (asymmetry = "
+        "built-in margin of safety).",
+    ]),
+    ("Hybrid Decision Matrix", C_BUY, [
+        "Combines the two timeframes into one action: fundamental verdict "
+        "(1–5y) × Kalman trend (≈3-month).",
+        "<b>Undervalued + BUY → Accumulate</b> (strongest); "
+        "<b>Overvalued + BUY → Speculative</b> (momentum only, tight stops); "
+        "<b>Undervalued + SELL → Wait</b> (value-trap risk).",
+        "When the two views <b>disagree</b>, the matrix surfaces it rather "
+        "than averaging them away.",
+    ]),
+]
+
+
+def render_glossary():
+    """Scannable dark-mode glossary; safe to call without analysis run."""
+    cards = []
+    for title, accent, points in GLOSSARY:
+        items = "".join(f'<li style="margin:3px 0">{p}</li>' for p in points)
+        cards.append(
+            f'<div style="border:1px solid rgba(128,128,128,.22);'
+            f'border-left:3px solid {accent};border-radius:10px;'
+            f'padding:10px 12px;margin-bottom:8px;'
+            f'background:rgba(128,128,128,.05)">'
+            f'<div style="font-family:ui-monospace,Menlo,monospace;'
+            f'font-weight:700;font-size:0.82rem;color:{accent};'
+            f'margin-bottom:4px">{title}</div>'
+            f'<ul style="margin:0;padding-left:16px;font-size:0.76rem;'
+            f'line-height:1.45;color:var(--text-color,#16191D)">{items}</ul>'
+            f'</div>')
+    st.markdown("".join(cards), unsafe_allow_html=True)
+
+
 HYBRID_MATRIX = {
     ("Undervalued", "BUY"):  ("ACCUMULATE", C_BUY,
         "Fundamentals cheap and trend confirms — strongest setup; size normally."),
@@ -619,3 +715,7 @@ with tab_value:
                     'quality / guidance are not captured. Use the override '
                     'to stress-test. Not investment advice.</div>',
                     unsafe_allow_html=True)
+
+    # ---- Glossary (always visible, independent of analysis) ----
+    with st.expander("📖 Glossary — what each term means & how it moves the output"):
+        render_glossary()
