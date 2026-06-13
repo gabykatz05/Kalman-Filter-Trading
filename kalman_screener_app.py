@@ -596,7 +596,7 @@ def get_fundamentals(t: str, demo: bool) -> dict:
                 "debt_to_equity": rs.uniform(20, 200),
                 "fcf": shares * price * rs.uniform(0.02, 0.07),
                 "auto_fcf": shares * price * rs.uniform(0.03, 0.07),
-                "auto_fcf_source": "median(Yahoo FCF, OCF−CapEx)",
+                "auto_fcf_source": "forward earnings × shares",
                 "trailing_growth": g, "growth_source": "revenue growth",
                 "currency": "USD"}
 
@@ -641,44 +641,53 @@ def get_fundamentals(t: str, demo: bool) -> dict:
 
 
 def auto_normalize_fcf(info, yahoo_fcf):
-    """Estimate a normalized annual FCF from light info-endpoint fields,
-    robust to the timing distortions that hit info['freeCashflow'].
+    """Estimate a normalized annual FCF using fields that are NOT drawn from
+    the same distorted trailing-twelve-month window as info['freeCashflow'].
 
-    Priority:
-      1. OCF − |CapEx| rebuilt from components — the most principled FCF and
-         far less timing-distorted than Yahoo's freeCashflow TTM print. Used
-         as the base whenever available.
-      2. If the OCF-based figure materially EXCEEDS Yahoo's (>15%), trust it
-         (Yahoo's is the depressed one). If they're close, take their mean.
-      3. Sanity floor at 0.9 × net income when cash-flow lines are missing.
-      4. Fall back to Yahoo's figure, then None.
+    Key insight: info['freeCashflow'] AND info['operatingCashflow'] share the
+    same TTM window, so a single bad quarter (e.g. LMT's negative-FCF Q1 from
+    billing timing) depresses both — rebuilding from them can't fix it.
+
+    The one forward-looking, un-bugged signal in the light endpoint is analyst
+    forward earnings. forwardEps × shares ≈ normalized forward net income,
+    which for mature profitable firms is a good proxy for run-rate FCF and
+    reflects a recovery the trailing window misses.
+
+    Logic:
+      anchor   = forwardEps × shares   (else trailingEps × shares)
+      trailing = Yahoo freeCashflow
+      • anchor only            -> anchor
+      • trailing only          -> trailing
+      • anchor ≥ trailing      -> anchor   (trailing looked depressed: LMT case)
+      • anchor < trailing      -> mean(anchor, trailing)  (FCF structurally
+                                   above earnings; don't overstate via NI alone)
     Returns (fcf_or_None, source_label).
     """
     def num(k):
         v = info.get(k)
         return float(v) if isinstance(v, (int, float)) and np.isfinite(v) else None
 
-    a = float(yahoo_fcf) if (yahoo_fcf and np.isfinite(yahoo_fcf) and yahoo_fcf > 0) else None
-    ocf, capex = num("operatingCashflow"), num("capitalExpenditures")
-    b = (ocf - abs(capex)) if (ocf and capex is not None and ocf - abs(capex) > 0) else None
-    ni = num("netIncomeToCommon") or num("netIncome")
-    c = 0.9 * ni if (ni and ni > 0) else None
+    shares = num("sharesOutstanding")
+    fwd_eps = num("forwardEps")
+    trl_eps = num("trailingEps")
 
-    if b is not None:
-        if a is None:
-            return b, "OCF−CapEx"
-        if b > a * 1.15:                     # Yahoo print is depressed
-            return b, f"OCF−CapEx (Yahoo {a/1e9:.1f}B looked depressed)"
-        return (a + b) / 2.0, "mean(Yahoo FCF, OCF−CapEx)"
+    anchor, anchor_lbl = None, None
+    if shares and fwd_eps and fwd_eps > 0:
+        anchor, anchor_lbl = fwd_eps * shares, "forward earnings × shares"
+    elif shares and trl_eps and trl_eps > 0:
+        anchor, anchor_lbl = trl_eps * shares, "trailing earnings × shares"
 
-    if a is not None:
-        # No OCF rebuild; floor against net income if Yahoo looks low
-        if c is not None and c > a * 1.15:
-            return (a + c) / 2.0, "mean(Yahoo FCF, 0.9×NetIncome)"
-        return a, "Yahoo FCF"
+    trailing = float(yahoo_fcf) if (yahoo_fcf and np.isfinite(yahoo_fcf)
+                                    and yahoo_fcf > 0) else None
 
-    if c is not None:
-        return c, "0.9×NetIncome (no cash-flow lines)"
+    if anchor is not None and trailing is not None:
+        if anchor >= trailing:
+            return anchor, f"{anchor_lbl} (Yahoo {trailing/1e9:.1f}B looked depressed)"
+        return (anchor + trailing) / 2.0, f"mean({anchor_lbl}, Yahoo FCF)"
+    if anchor is not None:
+        return anchor, anchor_lbl
+    if trailing is not None:
+        return trailing, "Yahoo FCF"
     return None, "Yahoo FCF"
 
 
